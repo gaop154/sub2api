@@ -2527,6 +2527,50 @@
         </div>
       </div>
 
+      <!-- 上游请求体脱敏（通用，不限平台） -->
+      <div class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4">
+        <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="input-label mb-0">{{ t('admin.accounts.upstreamDesensitize.label') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.upstreamDesensitize.hint') }}
+              </p>
+            </div>
+            <button
+              type="button"
+              @click="upstreamDesensitizeEnabled = !upstreamDesensitizeEnabled"
+              :class="[
+                'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+                upstreamDesensitizeEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+              ]"
+            >
+              <span
+                :class="[
+                  'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                  upstreamDesensitizeEnabled ? 'translate-x-5' : 'translate-x-0'
+                ]"
+              />
+            </button>
+          </div>
+          <div v-if="upstreamDesensitizeEnabled" class="mt-3">
+            <label class="input-label text-xs">{{ t('admin.accounts.upstreamDesensitize.modeLabel') }}</label>
+            <select
+              v-model="upstreamDesensitizeCompactMode"
+              class="mt-1 block w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 dark:border-dark-500 dark:bg-dark-700 dark:text-white"
+            >
+              <option value="">{{ t('admin.accounts.upstreamDesensitize.modeOff') }}</option>
+              <option value="light">{{ t('admin.accounts.upstreamDesensitize.modeLight') }}</option>
+              <option value="full">{{ t('admin.accounts.upstreamDesensitize.modeFull') }}</option>
+              <option value="stealth">{{ t('admin.accounts.upstreamDesensitize.modeStealth') }}</option>
+            </select>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.upstreamDesensitize.modeHint') }}
+            </p>
+          </div>
+        </div>
+      </div>
+
       <!-- Group Selection - 仅标准模式显示 -->
       <GroupSelector
         v-if="!authStore.isSimpleMode"
@@ -2838,6 +2882,10 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+// 上游请求体脱敏（通用开关，不限平台；缓解 CodeBuddy 等上游内容审核误拦）
+const upstreamDesensitizeEnabled = ref(false)
+// 压缩模式：'' = 仅零宽（默认）| 'light' = 温和压缩 | 'full' = 整段压缩
+const upstreamDesensitizeCompactMode = ref('')
 
 // OpenAI 自动透传开关（OAuth/API Key）
 const openaiPassthroughEnabled = ref(false)
@@ -3273,6 +3321,13 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	autoPause5hDisabled.value = extra?.auto_pause_5h_disabled === true
 	autoPause7dDisabled.value = extra?.auto_pause_7d_disabled === true
 	upstreamBillingAutoProbeEnabled.value = extra?.upstream_billing_probe_enabled === true
+
+	// 上游请求体脱敏（通用开关）：后端未扁平化，回填必须读 extra 原始字段
+	upstreamDesensitizeEnabled.value = extra?.upstream_desensitize_enabled === true
+	// 压缩模式仅接受合法值，其余一律归一为 ''（仅零宽）
+	const compactMode = extra?.upstream_desensitize_compact_mode
+	upstreamDesensitizeCompactMode.value =
+		compactMode === 'light' || compactMode === 'full' || compactMode === 'stealth' ? compactMode : ''
 
   // Load OpenAI passthrough toggle (OpenAI OAuth/SetupToken/API Key)
   openaiPassthroughEnabled.value = false
@@ -4655,6 +4710,24 @@ const handleSubmit = async () => {
       writeQuotaNotifyToExtra(newExtra, 'update')
       updatePayload.extra = newExtra
     }
+
+    // 上游请求体脱敏（通用开关，不限平台，确保所有平台分支都能保存这两个 key）
+    const desensitizeExtra: Record<string, unknown> = {
+      ...((updatePayload.extra as Record<string, unknown>) ||
+        (props.account.extra as Record<string, unknown>) || {})
+    }
+    if (upstreamDesensitizeEnabled.value) {
+      desensitizeExtra.upstream_desensitize_enabled = true
+      if (upstreamDesensitizeCompactMode.value) {
+        desensitizeExtra.upstream_desensitize_compact_mode = upstreamDesensitizeCompactMode.value
+      } else {
+        delete desensitizeExtra.upstream_desensitize_compact_mode
+      }
+    } else {
+      delete desensitizeExtra.upstream_desensitize_enabled
+      delete desensitizeExtra.upstream_desensitize_compact_mode
+    }
+    updatePayload.extra = desensitizeExtra
 
     const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
       await submitUpdateAccount(accountID, updatePayload)

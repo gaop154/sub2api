@@ -83,6 +83,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 
+	// 可选：发往上游前对请求体做脱敏（仅对在账号 Extra 里开启的渠道生效）。
+	// 缓解上游（如 CodeBuddy copilot.tencent.com）内容审核对客户端 system / harness / tools
+	// 合规声明术语的误拦。位于 body 规整段之后、originalBody 赋值之前，所有下游分支一致生效。
+	if account.IsUpstreamDesensitizeEnabled() {
+		body = DesensitizeOpenAIBody(body, DesensitizeOpts{
+			Enabled:     true,
+			CompactMode: account.UpstreamDesensitizeCompactMode(),
+		})
+	}
+
 	originalBody := body
 	requestView := newOpenAIRequestView(body)
 	reqModel, reqStream, promptCacheKey := requestView.Model, requestView.Stream, requestView.PromptCacheKey
@@ -1006,6 +1016,8 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		targetURL = openaiPlatformAPIURL
 	}
 	targetURL = appendOpenAIResponsesRequestPathSuffix(targetURL, openAIResponsesRequestPathSuffix(c))
+
+	body = s.prepareUpstreamBody(account, body, targetURL, isStream)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {

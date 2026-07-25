@@ -828,6 +828,17 @@ export default {
           hint: '启用后，新会话会优先调度到该客户端之前使用过的账号，避免频繁切换账号'
         }
       },
+      // 上游请求体脱敏（通用开关，不限平台）
+      upstreamDesensitize: {
+        label: '上游请求体脱敏',
+        hint: '对发往上游的 system/harness/tools 模板做零宽脱敏，缓解内容审核误拦（如 CodeBuddy）。',
+        modeLabel: '压缩模式',
+        modeHint: '关闭=仅零宽脱敏（保留原文）；温和=定点压缩 Claude Code 开头的身份与安全声明段（保留行为指令）；完整=整段压缩 system（会丢失部分行为指令）；隐蔽=把 harness 搬进首条 user 消息、system 仅留中性句，绕过只审核 system/developer 角色的上游（适用 CodeBuddy，推荐）',
+        modeOff: '关闭（仅零宽）',
+        modeLight: '温和',
+        modeFull: '完整',
+        modeStealth: '隐蔽'
+      },
       affinityNoClients: '无亲和客户端',
       affinityClients: '{count} 个亲和客户端：',
       affinitySection: '客户端亲和',
