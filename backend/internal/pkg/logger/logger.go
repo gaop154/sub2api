@@ -509,6 +509,28 @@ func LegacyPrintf(component, format string, args ...any) {
 	}
 }
 
+// LegacyPrintfInfo 以固定 INFO 级别记录，跳过 inferStdLogLevel 的关键词级别猜测。
+// 适用于消息体可能含 "error"/"panic" 等词但语义并非错误的场景（如打印上游请求体预览）：
+// LegacyPrintf 会因这类词把级别误判为 ERROR，触发 zap stacktrace（默认 stacktraceLevel=Error）
+// 造成“假 panic”堆栈。固定 INFO 低于 stacktrace 门槛，不附加堆栈。
+func LegacyPrintfInfo(component, format string, args ...any) {
+	msg := normalizeStdLogMessage(fmt.Sprintf(format, args...))
+	if msg == "" {
+		return
+	}
+	initialized := global.Load() != nil
+	if !initialized {
+		log.Print(msg)
+		return
+	}
+	l := L()
+	if component != "" {
+		l = l.With(zap.String("component", component))
+	}
+	l = l.WithOptions(zap.AddCallerSkip(1))
+	l.Info(msg, zap.Bool("legacy_printf", true))
+}
+
 type contextKey string
 
 const loggerContextKey contextKey = "ctx_logger"

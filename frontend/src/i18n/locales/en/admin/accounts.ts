@@ -773,6 +773,17 @@ export default {
           hint: 'When enabled, new sessions prefer accounts previously used by this client to reduce account switching'
         }
       },
+      // 上游请求体脱敏（通用开关，不限平台）
+      upstreamDesensitize: {
+        label: 'Upstream Body Desensitize',
+        hint: 'Insert zero-width spaces into system/harness/tools templates sent upstream to bypass false-positive content review (e.g. CodeBuddy).',
+        modeLabel: 'Compact mode',
+        modeHint: 'Off = zero-width desensitize only (keeps original text); Light = targeted trim of Claude Code opening identity & safety preamble (keeps behavior instructions); Full = full system compaction (loses some behavior instructions); Stealth = move the harness into the first user message with a neutral system line, bypassing upstreams that only review system/developer roles (best for CodeBuddy, recommended)',
+        modeOff: 'Off (zero-width only)',
+        modeLight: 'Light',
+        modeFull: 'Full',
+        modeStealth: 'Stealth'
+      },
       affinityNoClients: 'No affinity clients',
       affinityClients: '{count} affinity clients:',
       affinitySection: 'Client Affinity',

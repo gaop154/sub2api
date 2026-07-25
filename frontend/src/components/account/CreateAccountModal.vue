@@ -2707,6 +2707,50 @@
         </div>
       </div>
 
+      <!-- 上游请求体脱敏（通用，不限平台） -->
+      <div class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4">
+        <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
+          <div class="flex items-center justify-between">
+            <div>
+              <label class="input-label mb-0">{{ t('admin.accounts.upstreamDesensitize.label') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.upstreamDesensitize.hint') }}
+              </p>
+            </div>
+            <button
+              type="button"
+              @click="upstreamDesensitizeEnabled = !upstreamDesensitizeEnabled"
+              :class="[
+                'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+                upstreamDesensitizeEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+              ]"
+            >
+              <span
+                :class="[
+                  'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                  upstreamDesensitizeEnabled ? 'translate-x-5' : 'translate-x-0'
+                ]"
+              />
+            </button>
+          </div>
+          <div v-if="upstreamDesensitizeEnabled" class="mt-3">
+            <label class="input-label text-xs">{{ t('admin.accounts.upstreamDesensitize.modeLabel') }}</label>
+            <select
+              v-model="upstreamDesensitizeCompactMode"
+              class="mt-1 block w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 dark:border-dark-500 dark:bg-dark-700 dark:text-white"
+            >
+              <option value="">{{ t('admin.accounts.upstreamDesensitize.modeOff') }}</option>
+              <option value="light">{{ t('admin.accounts.upstreamDesensitize.modeLight') }}</option>
+              <option value="full">{{ t('admin.accounts.upstreamDesensitize.modeFull') }}</option>
+              <option value="stealth">{{ t('admin.accounts.upstreamDesensitize.modeStealth') }}</option>
+            </select>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.upstreamDesensitize.modeHint') }}
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div>
         <div class="mb-1 flex items-center gap-2">
           <label class="input-label mb-0">{{ t('admin.accounts.proxy') }}</label>
@@ -3952,6 +3996,10 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+// 上游请求体脱敏（通用开关，不限平台；缓解 CodeBuddy 等上游内容审核误拦）
+const upstreamDesensitizeEnabled = ref(false)
+// 压缩模式：'' = 仅零宽（默认）| 'light' = 温和压缩 | 'full' = 整段压缩
+const upstreamDesensitizeCompactMode = ref('')
 
 // Gemini tier selection (used as fallback when auto-detection is unavailable/fails)
 const geminiTierGoogleOne = ref<'google_one_free' | 'google_ai_pro' | 'google_ai_ultra'>('google_one_free')
@@ -4687,6 +4735,9 @@ const resetForm = () => {
   cacheTTLOverrideTarget.value = '5m'
   customBaseUrlEnabled.value = false
   customBaseUrl.value = ''
+  // 上游请求体脱敏（通用开关）
+  upstreamDesensitizeEnabled.value = false
+  upstreamDesensitizeCompactMode.value = ''
   allowOverages.value = false
   antigravityAccountType.value = 'oauth'
   antigravityProjectId.value = ''
@@ -4814,6 +4865,22 @@ const buildAnthropicExtra = (base?: Record<string, unknown>): Record<string, unk
 
 // Helper function to create account with mixed channel warning handling
 const doCreateAccount = async (payload: CreateAccountRequest) => {
+  // 上游请求体脱敏（通用开关，不限平台；统一在 doCreateAccount 漏斗应用，
+  // 覆盖 apikey / oauth / service_account / bedrock 等所有走该函数的创建分支）
+  const desensitizeExtra: Record<string, unknown> = { ...(payload.extra || {}) }
+  if (upstreamDesensitizeEnabled.value) {
+    desensitizeExtra.upstream_desensitize_enabled = true
+    if (upstreamDesensitizeCompactMode.value) {
+      desensitizeExtra.upstream_desensitize_compact_mode = upstreamDesensitizeCompactMode.value
+    } else {
+      delete desensitizeExtra.upstream_desensitize_compact_mode
+    }
+  } else {
+    delete desensitizeExtra.upstream_desensitize_enabled
+    delete desensitizeExtra.upstream_desensitize_compact_mode
+  }
+  payload.extra = desensitizeExtra
+
   const canContinue = await ensureAntigravityMixedChannelConfirmed(async () => {
     await submitCreateAccount(payload)
   })
@@ -5239,6 +5306,7 @@ const createAccountAndFinish = async (
       delete credentials.model_mapping
     }
   }
+
   await doCreateAccount({
     name: form.name,
     notes: form.notes,
@@ -6219,6 +6287,19 @@ const handleCookieAuth = async (sessionKey: string) => {
         if (customBaseUrlEnabled.value && customBaseUrl.value.trim()) {
           extra.custom_base_url_enabled = true
           extra.custom_base_url = customBaseUrl.value.trim()
+        }
+
+        // 上游请求体脱敏（通用开关，不限平台；多 token 批量创建分支）
+        if (upstreamDesensitizeEnabled.value) {
+          extra.upstream_desensitize_enabled = true
+          if (upstreamDesensitizeCompactMode.value) {
+            extra.upstream_desensitize_compact_mode = upstreamDesensitizeCompactMode.value
+          } else {
+            delete extra.upstream_desensitize_compact_mode
+          }
+        } else {
+          delete extra.upstream_desensitize_enabled
+          delete extra.upstream_desensitize_compact_mode
         }
 
         const accountName = keys.length > 1 ? `${form.name} #${i + 1}` : form.name

@@ -1,0 +1,8 @@
+allowBuilds:
+  esbuild: true
+  vue-demi: true
+# 从 package.json 的 pnpm.overrides 迁移而来（pnpm 10+ 不再读取 package.json 的 pnpm 字段）
+overrides:
+  js-cookie: 3.0.7
+  "form-data@<4.0.6": ">=4.0.6"
+  "postcss@<8.5.18": ">=8.5.18"

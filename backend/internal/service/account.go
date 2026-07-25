@@ -2031,6 +2031,45 @@ func (a *Account) GetCustomBaseURL() string {
 	return a.GetExtraString("custom_base_url")
 }
 
+// IsUpstreamDesensitizeEnabled 检查是否启用「发往上游前请求体脱敏」。
+// 通用开关，不限平台 / 类型，默认关闭。用于缓解上游（如 CodeBuddy copilot.tencent.com）
+// 内容审核对客户端 system / harness / tools 合规声明术语（DoS / exploit / credential 等）的误拦。
+func (a *Account) IsUpstreamDesensitizeEnabled() bool {
+	if a == nil || a.Extra == nil {
+		return false
+	}
+	if v, ok := a.Extra["upstream_desensitize_enabled"]; ok {
+		if enabled, ok := v.(bool); ok {
+			return enabled
+		}
+	}
+	return false
+}
+
+// UpstreamDesensitizeCompactMode 返回脱敏压缩模式：
+//   - ""（默认）：仅零宽插入，保留 system / harness 原文，最保真。
+//   - "light"：温和压缩——定点删除 Claude Code 开头的身份+安全声明段（敏感词最密集），
+//     保留 `# Harness` 及之后的全部行为指令，保留部分仍做零宽脱敏。
+//   - "full"：整段压缩——将 Codex / Claude Code 注入的超长运行时提示压成短摘要。
+//   - "stealth"：隐蔽模式——把 system / developer 消息整段搬到首条 user 消息
+//     （CodeBuddy 实测不审 role=user），system 仅留中性身份句过审，harness 原文保留
+//     全部行为指令、不做零宽；tools 仍做零宽脱敏。
+//
+// 仅接受 extra["upstream_desensitize_compact_mode"] 的 string 值 "light" / "full" / "stealth"；
+// 未配置 / 空串 / 类型错误 / 非法值一律返回 ""。
+func (a *Account) UpstreamDesensitizeCompactMode() string {
+	if a == nil || a.Extra == nil {
+		return ""
+	}
+	if v, ok := a.Extra["upstream_desensitize_compact_mode"].(string); ok {
+		switch v {
+		case "light", "full", "stealth":
+			return v
+		}
+	}
+	return ""
+}
+
 // IsCacheTTLOverrideEnabled 检查是否启用缓存 TTL 强制替换
 // 仅适用于 Anthropic OAuth/SetupToken 类型账号
 // 启用后将所有 cache creation tokens 归入指定的 TTL 类型（5m 或 1h）

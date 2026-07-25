@@ -143,3 +143,4 @@ docs/*
 frontend/coverage/
 aicodex
 output/
+.trellis
