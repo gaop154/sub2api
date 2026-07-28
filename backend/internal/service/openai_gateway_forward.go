@@ -102,6 +102,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
 	}
 
+	// grok_search：SSO cookie 走 console.x.ai/v1/responses，与 grok 平台（OIDC + cli-chat-proxy）
+	// 物理隔离，目的绕开 multi-agent 的 personal-team-blocked:spending-limit (402)。
+	if account.Platform == PlatformGrokSearch {
+		return s.forwardGrokSearch(ctx, c, account, body, originalModel, reqStream, startTime)
+	}
+
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
 		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body)
 	}

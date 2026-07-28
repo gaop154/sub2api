@@ -23,6 +23,7 @@ const (
 	PlatformGemini      = "gemini"
 	PlatformAntigravity = "antigravity"
 	PlatformGrok        = "grok"
+	PlatformGrokSearch  = "grok_search"
 	PlatformComposite   = "composite"
 )
 
