@@ -647,17 +647,15 @@ export default {
       },
       grokSearch: {
         ssoDesc:
-          'Grok Search 走 console.x.ai 的 SSO cookie 通道。每行粘贴一个 SSO token，每行创建一个账号。与 Grok OAuth 不同，此处不做 token 兑换 —— SSO cookie 直接使用，按网页订阅配额计费。',
-        ssoLabel: 'Grok Search SSO Token',
-        ssoPlaceholder: '每行一个 SSO token\n支持多个，每行一个',
+          '走 console.x.ai 的 SSO cookie 通道，按网页订阅配额计费（不做 token 兑换，与 Grok OAuth 不同）。',
+        ssoLabel: 'SSO Token',
+        ssoPlaceholder: '粘贴 SSO token（支持 sso=xxx 或 cookie 整串，后端自动归一化）',
         ssoHint:
-          '每行一个 SSO token（即 sso / sso-rw cookie 的值）。SSO 无自动保活，失效（401）时需重新导入。',
-        ssoRequired: '请至少输入一个 SSO token',
+          '即浏览器 sso / sso-rw cookie 的值；SSO 无自动保活，失效（401）后需重新导入。',
+        ssoRequired: '请输入 SSO token',
         baseUrlLabel: 'Console Base URL',
         baseUrlPlaceholder: 'https://console.x.ai',
-        baseUrlHint: '默认 https://console.x.ai，仅当通过自建代理转发 console 时才需修改。',
-        importing: '导入中...',
-        importAndCreate: '导入并创建账号'
+        baseUrlHint: '默认 https://console.x.ai，仅当通过自建代理转发 console 时才需修改。'
       },
       anthropic: {
         apiKeyPassthrough: '自动透传（仅替换认证）',

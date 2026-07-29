@@ -587,17 +587,15 @@ export default {
       },
       grokSearch: {
         ssoDesc:
-          'Grok Search uses the console.x.ai SSO cookie channel. Paste one SSO token per line; each line creates one account. Unlike Grok OAuth, no token exchange is performed — the SSO cookie is used directly and billed against the web subscription quota.',
-        ssoLabel: 'Grok Search SSO Token',
-        ssoPlaceholder: 'One SSO token per line\nSupports multiple, one per line',
+          'Uses the console.x.ai SSO cookie channel, billed against the web subscription quota (no token exchange, unlike Grok OAuth).',
+        ssoLabel: 'SSO Token',
+        ssoPlaceholder: 'Paste SSO token (sso=xxx or full cookie string; auto-normalized server-side)',
         ssoHint:
-          'One SSO token per line. Tokens are imported as-is (sso / sso-rw cookie value). There is no auto-refresh; re-import when a token expires (401).',
-        ssoRequired: 'Please enter at least one SSO token',
+          'The value of the browser sso / sso-rw cookie; no auto-refresh, re-import after a token expires (401).',
+        ssoRequired: 'Please enter the SSO token',
         baseUrlLabel: 'Console Base URL',
         baseUrlPlaceholder: 'https://console.x.ai',
-        baseUrlHint: 'Defaults to https://console.x.ai. Only change if you proxy the console endpoint.',
-        importing: 'Importing...',
-        importAndCreate: 'Import & Create Account'
+        baseUrlHint: 'Defaults to https://console.x.ai. Only change if you proxy the console endpoint.'
       },
       anthropic: {
         apiKeyPassthrough: 'Auto passthrough (auth only)',

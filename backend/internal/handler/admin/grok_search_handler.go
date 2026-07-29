@@ -46,6 +46,9 @@ type grokSearchSSOImportRequest struct {
 	BaseURL   string  `json:"base_url"`
 	ProxyID   *int64  `json:"proxy_id"`
 	GroupIDs  []int64 `json:"group_ids"`
+	// Name 为可选账号名前缀：单 token 时直接作为账号名，多 token 时追加 #N。
+	// 为空则回落到默认名（批量导入无法用单一名称时按顺序命名）。
+	Name string `json:"name"`
 }
 
 type grokSearchSSOImportItemResult struct {
@@ -98,6 +101,8 @@ func (h *GrokSearchHandler) CreateAccountsFromSSO(c *gin.Context) {
 	groupIDs := append([]int64(nil), req.GroupIDs...)
 
 	ctx := c.Request.Context()
+	// 用户在创建弹窗填写的账号名（可选）；非空时作为命名 base，否则用默认名。
+	nameBase := strings.TrimSpace(req.Name)
 	workerCount := grokSearchSSOImportConcurrency
 	if len(tokens) < workerCount {
 		workerCount = len(tokens)
@@ -110,7 +115,7 @@ func (h *GrokSearchHandler) CreateAccountsFromSSO(c *gin.Context) {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				items[job.index] = h.safeCreateGrokSearchAccountFromSSOToken(ctx, baseURL, groupIDs, req.ProxyID, job.token, job.index+1, len(tokens))
+				items[job.index] = h.safeCreateGrokSearchAccountFromSSOToken(ctx, baseURL, groupIDs, req.ProxyID, job.token, job.index+1, len(tokens), nameBase)
 			}
 		}()
 	}
@@ -143,6 +148,7 @@ func (h *GrokSearchHandler) safeCreateGrokSearchAccountFromSSOToken(
 	proxyID *int64,
 	token string,
 	index, total int,
+	nameBase string,
 ) (result grokSearchSSOImportWorkerResult) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -155,7 +161,7 @@ func (h *GrokSearchHandler) safeCreateGrokSearchAccountFromSSOToken(
 			}
 		}
 	}()
-	return h.createGrokSearchAccountFromSSOToken(ctx, baseURL, groupIDs, proxyID, token, index, total)
+	return h.createGrokSearchAccountFromSSOToken(ctx, baseURL, groupIDs, proxyID, token, index, total, nameBase)
 }
 
 // createGrokSearchAccountFromSSOToken 单个 SSO token → grok_search 账号。
@@ -167,8 +173,9 @@ func (h *GrokSearchHandler) createGrokSearchAccountFromSSOToken(
 	proxyID *int64,
 	token string,
 	index, total int,
+	nameBase string,
 ) grokSearchSSOImportWorkerResult {
-	name := grokSearchSSOImportAccountName(index, total)
+	name := grokSearchSSOImportAccountName(index, total, nameBase)
 	account, err := h.adminService.CreateAccount(ctx, &service.CreateAccountInput{
 		Name:     name,
 		Platform: service.PlatformGrokSearch,
@@ -197,10 +204,14 @@ func (h *GrokSearchHandler) createGrokSearchAccountFromSSOToken(
 	}
 }
 
-// grokSearchSSOImportAccountName 生成默认账号名。SSO token 本身不携带 email，
-// 只能按导入顺序命名（与 grok OAuth 路径不同，后者优先用 tokenInfo.Email）。
-func grokSearchSSOImportAccountName(index, total int) string {
-	const base = "Grok Search SSO Account"
+// grokSearchSSOImportAccountName 生成账号名。优先用用户填写的 nameBase（前端 form.name），
+// 为空时回落到默认名。SSO token 不携带 email，多 token 时按导入顺序追加 #N。
+func grokSearchSSOImportAccountName(index, total int, nameBase string) string {
+	const defaultBase = "Grok Search SSO Account"
+	base := strings.TrimSpace(nameBase)
+	if base == "" {
+		base = defaultBase
+	}
 	if total > 1 {
 		return fmt.Sprintf("%s #%d", base, index)
 	}

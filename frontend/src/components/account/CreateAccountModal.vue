@@ -1586,25 +1586,19 @@
             {{ t('admin.accounts.grokSearch.ssoDesc') }}
           </p>
 
-          <!-- SSO token 批量输入 -->
+          <!-- SSO token（单账号，提交走通用创建接口，归一化由后端完成） -->
           <div class="mb-4">
             <label class="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-300">
               <Icon name="key" size="sm" class="text-slate-500" />
               {{ t('admin.accounts.grokSearch.ssoLabel') }}
-              <span
-                v-if="grokSearchSsoCount > 1"
-                class="rounded-full bg-slate-500 px-2 py-0.5 text-xs text-white"
-              >
-                {{ t('admin.accounts.oauth.keysCount', { count: grokSearchSsoCount }) }}
-              </span>
             </label>
-            <textarea
-              v-model="grokSearchSsoTokens"
-              rows="5"
-              class="input w-full resize-y font-mono text-sm"
+            <input
+              v-model="grokSearchSsoToken"
+              type="password"
+              class="input w-full font-mono text-sm"
               :placeholder="t('admin.accounts.grokSearch.ssoPlaceholder')"
               spellcheck="false"
-            ></textarea>
+            />
             <p class="mt-1 text-xs text-slate-600 dark:text-slate-400">
               {{ t('admin.accounts.grokSearch.ssoHint') }}
             </p>
@@ -1621,40 +1615,6 @@
             />
             <p class="input-hint">{{ t('admin.accounts.grokSearch.baseUrlHint') }}</p>
           </div>
-
-          <!-- 导入结果错误展示 -->
-          <div
-            v-if="grokSearchError"
-            class="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 dark:border-red-700 dark:bg-red-900/30"
-          >
-            <p class="whitespace-pre-line text-sm text-red-600 dark:text-red-400">
-              {{ grokSearchError }}
-            </p>
-          </div>
-
-          <!-- 提交按钮（批量导入，触发独立接口） -->
-          <button
-            type="button"
-            class="btn btn-primary w-full"
-            :disabled="submitting || !grokSearchSsoTokens.trim()"
-            @click="handleGrokSearchImportSSO"
-          >
-            <svg
-              v-if="submitting"
-              class="-ml-1 mr-2 h-4 w-4 animate-spin"
-              fill="none"
-              viewBox="0 0 24 24"
-            >
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-              <path
-                class="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-              ></path>
-            </svg>
-            <Icon v-else name="sparkles" size="sm" class="mr-2" />
-            {{ submitting ? t('admin.accounts.grokSearch.importing') : t('admin.accounts.grokSearch.importAndCreate') }}
-          </button>
         </div>
       </div>
 
@@ -3329,7 +3289,7 @@
         <button
           type="submit"
           form="create-account-form"
-          :disabled="submitting"
+          :disabled="submitting || (form.platform === 'grok_search' && !grokSearchSsoToken.trim())"
           class="btn btn-primary"
           data-tour="account-form-submit"
         >
@@ -3826,19 +3786,9 @@ const apiKeyBaseUrl = ref('https://api.anthropic.com')
 const apiKeyValue = ref('')
 const upstreamBillingAutoProbeEnabled = ref(true)
 
-// Grok Search（console.x.ai SSO 通道）专用状态：批量 SSO 导入 + base_url
-const grokSearchSsoTokens = ref('')
+// Grok Search（console.x.ai SSO 通道）专用状态：单账号 SSO token + base_url
+const grokSearchSsoToken = ref('')
 const grokSearchBaseUrl = ref('https://console.x.ai')
-const grokSearchError = ref('')
-
-// 解析 grok_search SSO 文本框中的非空行数（用于批量计数徽标）
-const grokSearchSsoCount = computed(() => {
-  if (!grokSearchSsoTokens.value.trim()) return 0
-  return grokSearchSsoTokens.value
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l).length
-})
 
 const syncPreviewCredentials = computed(() => {
   if (!apiKeyValue.value) return undefined
@@ -4364,9 +4314,10 @@ watch(
       form.load_factor = null
     }
     if (newPlatform === 'grok_search') {
-      // grok_search 走 SSO cookie 批量导入，类型固定为 apikey（非 OAuth 流程）
+      // grok_search 走单账号 SSO 创建，类型固定为 apikey（非 OAuth 流程）
       accountCategory.value = 'apikey'
       addMethod.value = 'oauth'
+      grokSearchSsoToken.value = ''
       grokSearchBaseUrl.value = 'https://console.x.ai'
     }
     if (newPlatform !== 'gemini' && newPlatform !== 'anthropic' && accountCategory.value === 'service_account') {
@@ -4786,10 +4737,9 @@ const resetForm = () => {
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
   upstreamBillingAutoProbeEnabled.value = true
-  // 重置 Grok Search SSO 导入状态
-  grokSearchSsoTokens.value = ''
+  // 重置 Grok Search SSO 状态
+  grokSearchSsoToken.value = ''
   grokSearchBaseUrl.value = 'https://console.x.ai'
-  grokSearchError.value = ''
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
   editQuotaWeeklyLimit.value = null
@@ -5228,9 +5178,24 @@ const handleSubmit = async () => {
     return
   }
 
-  // Grok Search 平台：走独立的 SSO 批量导入接口（不走通用 apikey 单账号创建）
+  // Grok Search 平台：单账号创建，走通用创建接口（与其他 apikey 平台后端一致）；
+  // SSO token 归一化（剥离 sso= / cookie 整串）由后端 Create handler 完成。
   if (form.platform === 'grok_search') {
-    await handleGrokSearchImportSSO()
+    if (!grokSearchSsoToken.value.trim()) {
+      appStore.showError(t('admin.accounts.grokSearch.ssoRequired'))
+      return
+    }
+    form.credentials = {
+      sso_token: grokSearchSsoToken.value,
+      base_url: grokSearchBaseUrl.value.trim() || 'https://console.x.ai'
+    }
+    const extra = buildAnthropicExtra(buildOpenAIExtra())
+    await doCreateAccount({
+      ...form,
+      group_ids: form.group_ids,
+      extra,
+      auto_pause_on_expired: autoPauseOnExpired.value
+    })
     return
   }
 
@@ -5609,69 +5574,6 @@ const handleGrokImportSSO = async (ssoInput: string) => {
     appStore.showError(grokOAuth.error.value)
   } finally {
     grokOAuth.loading.value = false
-  }
-}
-
-// Grok Search SSO 批量导入：调 /admin/grok-search/sso，SSO cookie 直接作为
-// console.x.ai 凭证，不做 OAuth 兑换。成功/失败按行反馈。
-const handleGrokSearchImportSSO = async () => {
-  const rawInput = grokSearchSsoTokens.value.trim()
-  if (!rawInput) {
-    appStore.showError(t('admin.accounts.grokSearch.ssoRequired'))
-    return
-  }
-  // 与后端逐行解析一致：仅做 trim + 过滤空行，不去重
-  const lineCount = rawInput
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l).length
-  if (lineCount === 0) {
-    appStore.showError(t('admin.accounts.grokSearch.ssoRequired'))
-    return
-  }
-
-  submitting.value = true
-  grokSearchError.value = ''
-
-  try {
-    const result = await adminAPI.grokSearch.createFromSSO({
-      sso_tokens: rawInput,
-      base_url: grokSearchBaseUrl.value.trim() || undefined,
-      proxy_id: form.proxy_id ?? undefined,
-      group_ids: form.group_ids
-    })
-
-    const successCount = result.created?.length || 0
-    const failedCount = result.failed?.length || 0
-
-    if (successCount > 0 && failedCount === 0) {
-      appStore.showSuccess(
-        lineCount > 1
-          ? t('admin.accounts.oauth.batchSuccess', { count: successCount })
-          : t('admin.accounts.accountCreated')
-      )
-      emit('created')
-      handleClose()
-    } else if (successCount > 0 && failedCount > 0) {
-      // 部分成功：保留输入，展示失败明细，刷新列表
-      appStore.showWarning(
-        t('admin.accounts.oauth.batchPartialSuccess', { success: successCount, failed: failedCount })
-      )
-      grokSearchError.value = (result.failed || [])
-        .map((item) => `${item.token}: ${item.error || t('admin.accounts.oauth.grok.failedToConvertSSO')}`)
-        .join('\n')
-      emit('created')
-    } else {
-      grokSearchError.value = (result.failed || [])
-        .map((item) => `${item.token}: ${item.error || t('admin.accounts.oauth.grok.failedToConvertSSO')}`)
-        .join('\n') || t('admin.accounts.oauth.grok.failedToConvertSSO')
-      appStore.showError(t('admin.accounts.oauth.batchFailed'))
-    }
-  } catch (error: any) {
-    grokSearchError.value = error.response?.data?.detail || error.message || t('admin.accounts.oauth.grok.failedToConvertSSO')
-    appStore.showError(grokSearchError.value)
-  } finally {
-    submitting.value = false
   }
 }
 

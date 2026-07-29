@@ -836,6 +836,15 @@ func (h *AccountHandler) Create(c *gin.Context) {
 	// base_rpm 输入校验：负值归零，超过 10000 截断
 	sanitizeExtraBaseRPM(req.Extra)
 
+	// grok_search 的 SSO token 归一化：用户可能粘贴 "sso=xxx" / "sso-rw=xxx" /
+	// cookie 整串，统一剥离成纯 token 值，避免 forwarder 拼 Cookie 时出现双 "sso="。
+	// 放在幂等前，使归一化后的值参与幂等 key（同一原始 token 的重复提交命中同一记录）。
+	if req.Platform == service.PlatformGrokSearch {
+		if raw, ok := req.Credentials["sso_token"].(string); ok {
+			req.Credentials["sso_token"] = xai.NormalizeSSOToken(raw)
+		}
+	}
+
 	// 确定是否跳过混合渠道检查
 	skipCheck := req.ConfirmMixedChannelRisk != nil && *req.ConfirmMixedChannelRisk
 
@@ -2456,8 +2465,9 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 		return
 	}
 
-	// Handle Grok accounts
-	if account.Platform == service.PlatformGrok {
+	// Handle Grok accounts（含 grok_search：SSO cookie 通道同样使用 xAI 模型集，
+	// 否则 grok_search 会 fallthrough 到末尾 Claude 分支，测试弹窗下拉全是 Claude 模型）
+	if account.Platform == service.PlatformGrok || account.Platform == service.PlatformGrokSearch {
 		defaultModels := xai.DefaultModels()
 
 		hasExplicitMapping := false
