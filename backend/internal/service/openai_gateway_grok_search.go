@@ -434,7 +434,9 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 	}
 	switch statusCode {
 	case http.StatusUnauthorized:
-		s.tempUnscheduleGrokSearch(ctx, account, 10*time.Minute, "grok_search sso token unauthorized (re-import required)")
+		// SSO 无 refresh，失效只能重导：持久标记需重认证（status=error + schedulable=false），
+		// 不用 temp 短时冷却（会 401 循环——10 分钟后恢复调度又用失效 SSO 打）。管理员重导 SSO 后账号恢复 active。
+		s.markGrokSearchReauthRequired(ctx, account)
 	case http.StatusTooManyRequests:
 		s.tempUnscheduleGrokSearch(ctx, account, 5*time.Minute, "grok_search rate limited")
 	default:
@@ -460,5 +462,25 @@ func (s *OpenAIGatewayService) tempUnscheduleGrokSearch(ctx context.Context, acc
 		stateCtx, cancel := openAIAccountStateContext(ctx)
 		defer cancel()
 		_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
+	}
+}
+
+// markGrokSearchReauthRequired 持久标记 grok_search 账号"需重认证"：
+// DB SetError（status=error + error_message + schedulable=false，不自动恢复）+ 内存调度即时下线。
+// 适用于 SSO 401 失效（SSO 无 refresh，只能管理员重导）。
+func (s *OpenAIGatewayService) markGrokSearchReauthRequired(ctx context.Context, account *Account) {
+	if s == nil || account == nil {
+		return
+	}
+	const reason = "grok_search SSO token unauthorized; re-import SSO required"
+	// 内存调度即时下线（24h 兜底，等 DB snapshot 同步；SSO 无 refresh 不会自愈）
+	s.BlockAccountScheduling(account, time.Now().Add(24*time.Hour), reason)
+	if s.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		defer cancel()
+		if err := s.accountRepo.SetError(stateCtx, account.ID, reason); err != nil {
+			logger.LegacyPrintf("service.openai_gateway_grok_search",
+				"mark grok_search reauth failed account_id=%d err=%v", account.ID, err)
+		}
 	}
 }
