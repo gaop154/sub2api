@@ -57,6 +57,9 @@ func RegisterAdminRoutes(
 		// Grok OAuth
 		registerGrokOAuthRoutes(admin, h)
 
+		// Grok Search（SSO Console 通道，与 Grok OAuth 物理隔离）
+		registerGrokSearchRoutes(admin, h)
+
 		// 代理管理
 		registerProxyRoutes(admin, h, stepUpAuth)
 
@@ -471,6 +474,16 @@ func registerGrokOAuthRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		grok.GET("/accounts/:id/quota", h.Admin.GrokOAuth.QueryQuota)
 		grok.POST("/accounts/:id/reset-quota", h.Admin.GrokOAuth.ResetQuota)
 		grok.GET("/runtime-sanity", h.Admin.GrokOAuth.RuntimeSanity)
+	}
+}
+
+// registerGrokSearchRoutes 注册 grok_search 平台的管理端路由（SSO → console.x.ai 通道）。
+// 与 grok OAuth 路由（registerGrokOAuthRoutes）独立分组，强调两条链路物理隔离。
+func registerGrokSearchRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	grokSearch := admin.Group("/grok-search")
+	{
+		// 批量导入 SSO token，创建 grok_search 账号（不走 OAuth 兑换）。
+		grokSearch.POST("/sso", h.Admin.GrokSearch.CreateAccountsFromSSO)
 	}
 }
 

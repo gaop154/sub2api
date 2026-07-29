@@ -585,6 +585,20 @@ export default {
         baseUrlHint: 'Grok OAuth accounts forward to the official xAI API base URL.',
         apiKeyHint: 'Grok subscription support uses OAuth refresh tokens; API keys are out of scope for this account type.'
       },
+      grokSearch: {
+        ssoDesc:
+          'Grok Search uses the console.x.ai SSO cookie channel. Paste one SSO token per line; each line creates one account. Unlike Grok OAuth, no token exchange is performed — the SSO cookie is used directly and billed against the web subscription quota.',
+        ssoLabel: 'Grok Search SSO Token',
+        ssoPlaceholder: 'One SSO token per line\nSupports multiple, one per line',
+        ssoHint:
+          'One SSO token per line. Tokens are imported as-is (sso / sso-rw cookie value). There is no auto-refresh; re-import when a token expires (401).',
+        ssoRequired: 'Please enter at least one SSO token',
+        baseUrlLabel: 'Console Base URL',
+        baseUrlPlaceholder: 'https://console.x.ai',
+        baseUrlHint: 'Defaults to https://console.x.ai. Only change if you proxy the console endpoint.',
+        importing: 'Importing...',
+        importAndCreate: 'Import & Create Account'
+      },
       anthropic: {
         apiKeyPassthrough: 'Auto passthrough (auth only)',
         apiKeyPassthroughDesc:

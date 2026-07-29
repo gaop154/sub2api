@@ -645,6 +645,20 @@ export default {
         baseUrlHint: 'Grok OAuth 账号会转发到官方 xAI API Base URL。',
         apiKeyHint: 'Grok 订阅支持使用 OAuth refresh token；API Key 账号不在本次范围内。'
       },
+      grokSearch: {
+        ssoDesc:
+          'Grok Search 走 console.x.ai 的 SSO cookie 通道。每行粘贴一个 SSO token，每行创建一个账号。与 Grok OAuth 不同，此处不做 token 兑换 —— SSO cookie 直接使用，按网页订阅配额计费。',
+        ssoLabel: 'Grok Search SSO Token',
+        ssoPlaceholder: '每行一个 SSO token\n支持多个，每行一个',
+        ssoHint:
+          '每行一个 SSO token（即 sso / sso-rw cookie 的值）。SSO 无自动保活，失效（401）时需重新导入。',
+        ssoRequired: '请至少输入一个 SSO token',
+        baseUrlLabel: 'Console Base URL',
+        baseUrlPlaceholder: 'https://console.x.ai',
+        baseUrlHint: '默认 https://console.x.ai，仅当通过自建代理转发 console 时才需修改。',
+        importing: '导入中...',
+        importAndCreate: '导入并创建账号'
+      },
       anthropic: {
         apiKeyPassthrough: '自动透传（仅替换认证）',
         apiKeyPassthroughDesc:
