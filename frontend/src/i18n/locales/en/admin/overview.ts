@@ -944,6 +944,7 @@ export default {
         gemini: 'Gemini',
         antigravity: 'Antigravity',
         grok: 'Grok',
+        grok_search: 'Grok Search',
         composite: 'Composite',
       },
       deleteConfirm:
