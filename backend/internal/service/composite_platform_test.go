@@ -58,8 +58,11 @@ func TestCompositeGroupSchedulerHasAllCanonicalPlatformBuckets(t *testing.T) {
 	for platform := range seen {
 		platforms = append(platforms, platform)
 	}
+	// schedulerSnapshotPlatforms() 自接入 grok_search（SSO+console.x.ai）后已纳入
+	// PlatformGrokSearch（scheduler_snapshot_service.go:801），canonical buckets 须与之对齐，
+	// 否则 grok_search 账号建号/关联分组后进不了调度可选池。
 	require.ElementsMatch(t,
-		[]string{PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformAntigravity, PlatformGrok},
+		[]string{PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformAntigravity, PlatformGrok, PlatformGrokSearch},
 		platforms,
 	)
 }
