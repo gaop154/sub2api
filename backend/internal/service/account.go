@@ -110,6 +110,13 @@ const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
 // absent/null value uses provider observations.
 const GrokMediaEligibleExtraKey = "grok_media_eligible"
 
+// GrokSearchChatCompletionsExtraKey 是 grok_search 账号的"chat completions 桥接开关"。
+// grok_search 默认只支持 /v1/responses 入口（console.x.ai 通道）；当该开关为 true 时，
+// /v1/chat/completions 才会走 forwardGrokSearchChatCompletionsViaResponses 桥
+// （chat body → responses body → console.x.ai → responses resp → 转回 chat resp）。
+// 缺省/非 bool 值按 false 处理（仅 grok_search 平台生效）。
+const GrokSearchChatCompletionsExtraKey = "grok_search_chat_completions"
+
 const (
 	OpenAIAuthModePersonalAccessToken = "personalAccessToken"
 	openAIAuthModeCredentialKey       = "auth_mode"
@@ -1664,6 +1671,20 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 		return enabled
 	}
 	return false
+}
+
+// IsGrokSearchChatCompletionsEnabled 返回 grok_search 账号是否开启 /v1/chat/completions 桥接。
+//
+// grok_search 默认只接受 /v1/responses 入口（console.x.ai 通道）；本开关为 true 时，
+// /v1/chat/completions 才会经 forwardGrokSearchChatCompletionsViaResponses 桥转发。
+// 字段缺失或类型非 bool 时按 false 处理（默认关闭，引导用户改用 /v1/responses）。
+// 仅对 PlatformGrokSearch 生效，其他平台一律返回 false。
+func (a *Account) IsGrokSearchChatCompletionsEnabled() bool {
+	if a == nil || a.Platform != PlatformGrokSearch || a.Extra == nil {
+		return false
+	}
+	enabled, ok := a.Extra[GrokSearchChatCompletionsExtraKey].(bool)
+	return ok && enabled
 }
 
 // IsOpenAIResponsesWebSocketV2Enabled 返回 OpenAI 账号是否开启 Responses WebSocket v2。

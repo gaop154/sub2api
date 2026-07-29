@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
@@ -483,4 +484,141 @@ func (s *OpenAIGatewayService) markGrokSearchReauthRequired(ctx context.Context,
 				"mark grok_search reauth failed account_id=%d err=%v", account.ID, err)
 		}
 	}
+}
+
+// forwardGrokSearchChatCompletionsViaResponses 把 grok_search 的 /v1/chat/completions
+// 请求桥接到 console.x.ai /v1/responses 通道。
+//
+// 设计参照 grok 平台的 forwardGrokChatCompletionsViaResponses（openai_gateway_grok_chat_bridge.go:506），
+// 但关键差异（grok 与 grok_search 物理隔离）：
+//   - 凭证：自读 sso_token（account.GetCredential("sso_token")），不调 getRequestCredential/GetAccessToken
+//     （grok_search 身份由 SSO cookie 唯一决定，无 OIDC token）。
+//   - 端点+请求构造：复用 buildGrokSearchRequest（console.x.ai + SSO cookie + Chrome headers），
+//     不用 buildGrokResponsesRequest（后者打 cli-chat-proxy.grok.com + OAuth Bearer）。
+//   - body：apicompat.ChatCompletionsToResponses 转 responses body → normalizeGrokSearchRequestBody
+//     （forwardGrokSearch 用的 console 契约归一化：store=false、tools 注入 web_search/x_search 等）。
+//   - 发送：DoWithTLS + grokSearchChromeProfile()（过 console.x.ai 的 Cloudflare），
+//     不用裸 Do（grok 桥走 cli-chat-proxy 不需要 Chrome 指纹）。
+//   - 错误处理：handleGrokSearchAccountUpstreamError（grok_search 独立策略，不含 402 冷却），
+//     不用 handleGrokAccountUpstreamError（后者会解析 grok OIDC 配额快照并触发 402 冷却）。
+//   - 响应：复用 handleChatStreamingResponse/handleChatBufferedStreamingResponse
+//     （chat 格式响应处理，客户端要的是 chat completions 而非 responses 格式）。
+//
+// 上游通道仍是 console.x.ai/v1/responses（responses 格式 SSE），但网关把它转回 chat completions
+// 格式写给客户端，因此与 forwardGrokSearch 的 responses 直写不同——本方法面向 chat completions 入口。
+func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	promptCacheKey string,
+	defaultMappedModel string,
+) (*OpenAIForwardResult, error) {
+	startTime := time.Now()
+
+	// 1. 解析 chat completions 请求
+	var chatReq apicompat.ChatCompletionsRequest
+	if err := json.Unmarshal(body, &chatReq); err != nil {
+		return nil, fmt.Errorf("parse grok_search chat completions request: %w", err)
+	}
+	originalModel := chatReq.Model
+	clientStream := chatReq.Stream
+	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
+	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
+	// grok_search multi-agent 靠 model 名进入对应模式；account.GetMappedModel 在 forwardGrokSearch
+	// 里已用于覆盖，这里同样以 GetMappedModel 为准（覆盖到 normalize 后的 upstreamModel）。
+	if mapped := account.GetMappedModel(originalModel); strings.TrimSpace(mapped) != "" {
+		upstreamModel = mapped
+	}
+
+	// 2. chat body → responses body
+	responsesReq, err := apicompat.ChatCompletionsToResponses(&chatReq)
+	if err != nil {
+		return nil, fmt.Errorf("convert grok_search chat completions to responses: %w", err)
+	}
+	responsesReq.Model = upstreamModel
+	// 上游始终流式（与 grok 桥、forwardGrokSearch 一致），由 handleChatBufferedStreamingResponse 聚合
+	responsesReq.Stream = true
+	responsesReq.Include = nil
+	responsesReq.Store = nil
+	responsesBody, err := json.Marshal(responsesReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal grok_search responses bridge request: %w", err)
+	}
+
+	// 3. 施加 console 契约（store=false、删 metadata/service_tier 等、tools 注入 web_search/x_search、
+	// include 补 reasoning.encrypted_content、reasoning.effort 归一）——与 forwardGrokSearch 同源。
+	responsesBody, err = normalizeGrokSearchRequestBody(responsesBody, upstreamModel)
+	if err != nil {
+		return nil, fmt.Errorf("normalize grok_search chat bridge request body: %w", err)
+	}
+
+	// 4. 自读 SSO 凭证 + 拼 console.x.ai/v1/responses（不走 GetAccessToken / grokTokenProvider）
+	ssoToken := strings.TrimSpace(account.GetCredential("sso_token"))
+	if ssoToken == "" {
+		return nil, fmt.Errorf("grok_search account missing sso_token credential")
+	}
+	baseURL := strings.TrimSpace(account.GetCredential("base_url"))
+	if baseURL == "" {
+		baseURL = grokSearchDefaultBaseURL
+	}
+	upstreamURL := strings.TrimSuffix(baseURL, "/") + grokSearchResponsesPath
+
+	// 5. 解耦客户端 context（客户端断开后上游仍可跑完用于计费/日志）
+	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	defer releaseUpstreamCtx()
+	req, err := buildGrokSearchRequest(upstreamCtx, responsesBody, ssoToken, upstreamURL)
+	if err != nil {
+		return nil, err
+	}
+	SetActualOpenAIUpstreamEndpoint(c, grokSearchResponsesPath)
+
+	// 6. 代理
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	// 7. 发送（CF 策略 L1：Chrome uTLS 指纹 + 一致 headers，与 forwardGrokSearch 同源）
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, grokSearchChromeProfile())
+	if err != nil {
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 8. 错误分流（grok_search 独立策略，不复用 grok 的 402 冷却 / quota snapshot）
+	if resp.StatusCode >= http.StatusBadRequest {
+		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if upstreamMsg == "" {
+			upstreamMsg = fmt.Sprintf("grok_search upstream returned status %d", resp.StatusCode)
+		}
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+			Kind:               "http_error",
+			Message:            upstreamMsg,
+		})
+		s.handleGrokSearchAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+		return s.handleChatCompletionsErrorResponse(resp, c, account, billingModel)
+	}
+
+	// 9. 成功响应：上游是 responses 格式 SSE，转为 chat completions 格式写给客户端
+	var result *OpenAIForwardResult
+	if clientStream {
+		result, err = s.handleChatStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime, len(body))
+	} else {
+		result, err = s.handleChatBufferedStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
+	}
+	if result != nil {
+		result.UpstreamEndpoint = grokSearchResponsesPath
+		result.ResponseHeaders = resp.Header.Clone()
+		if result.RequestID == "" {
+			result.RequestID = firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id"))
+		}
+		result.ReasoningEffort = extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
+	}
+	return result, err
 }

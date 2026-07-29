@@ -47,7 +47,7 @@ func RegisterGatewayRoutes(
 
 	isOpenAIResponsesCompatibleGatewayPlatform := func(c *gin.Context) bool {
 		switch getGroupPlatform(c) {
-		case service.PlatformOpenAI, service.PlatformGrok:
+		case service.PlatformOpenAI, service.PlatformGrok, service.PlatformGrokSearch:
 			return true
 		default:
 			return false
@@ -203,6 +203,10 @@ func RegisterGatewayRoutes(
 		})
 		// OpenAI Chat Completions API: auto-route based on group platform
 		gateway.POST("/chat/completions", func(c *gin.Context) {
+			// grok_search 默认仅支持 /v1/responses；/v1/chat/completions 是否放行由账号级
+			// Extra 开关 grok_search_chat_completions 决定（ForwardAsChatCompletions 内部分流，
+			// 关闭时 400 拒绝、开启时走 chat→responses 桥）。这里不拦截，交由 isOpenAIResponses
+			// CompatibleGatewayPlatform 接管路由（grok_search 在其列表内）。
 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
 				h.OpenAIGateway.ChatCompletions(c)
 				return

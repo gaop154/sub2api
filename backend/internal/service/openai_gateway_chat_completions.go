@@ -85,6 +85,19 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
 	}
 
+	// grok_search：默认只支持 /v1/responses 入口（console.x.ai 通道）。账号级 Extra 开关
+	// grok_search_chat_completions 开启时，才走 chat→responses 桥（forwardGrokSearchChatCompletionsViaResponses）；
+	// 关闭时直接 400 拒绝，引导改用 /v1/responses。grok_search 凭证是 sso_token 而非 api_key，
+	// 不能 fallthrough 到下方任何走 GetAccessToken 的链路。
+	if account.Platform == PlatformGrokSearch {
+		if !account.IsGrokSearchChatCompletionsEnabled() {
+			writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error",
+				"grok_search account has chat completions disabled; enable grok_search_chat_completions in account Extra or use /v1/responses")
+			return nil, errors.New("grok_search chat completions disabled")
+		}
+		return s.forwardGrokSearchChatCompletionsViaResponses(ctx, c, account, body, promptCacheKey, defaultMappedModel)
+	}
+
 	// 入口分流：APIKey 账号 + 强制或已探测确认上游不支持 Responses，走 CC 直转。
 	// 自动模式下标记缺失（未探测）按"现状即证据"原则继续走下方原 Responses 转换路径。
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {

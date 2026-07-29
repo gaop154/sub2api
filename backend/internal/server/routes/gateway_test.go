@@ -106,6 +106,28 @@ func TestGatewayRoutesAlphaSearchRejectsNonOpenAIGroup(t *testing.T) {
 	require.Contains(t, w.Body.String(), "only available for OpenAI groups")
 }
 
+// grok_search 的 /v1/chat/completions 路由：改前在路由层硬拒 400
+// （"only support the /v1/responses endpoint"），现下沉到账号级开关
+// （grok_search_chat_completions，ForwardAsChatCompletions 内部分流）。
+// 本测试锁住"路由层不再硬拒"：grok_search 的 chat completions 请求应进入
+// OpenAIGateway.ChatCompletions handler（而非被 400 硬拒、也非 404）。
+// 实际的开关放行/拒绝逻辑由 service 层单测覆盖（见
+// TestForwardGrokSearchChatCompletions_DisabledRejects400 / _EnabledBridgesViaConsoleResponses）。
+func TestGatewayRoutesGrokSearchChatCompletionsRoutesToOpenAIGateway(t *testing.T) {
+	router := newGatewayRoutesTestRouter(service.PlatformGrokSearch)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	// 不再 404（路径已注册到 OpenAI 网关路由）
+	require.NotEqual(t, http.StatusNotFound, w.Code)
+	// 不再路由层硬拒：不含旧的硬拒错误信息
+	require.NotContains(t, w.Body.String(), "only support the /v1/responses endpoint")
+}
+
+
 func TestGatewayRoutesOpenAIImagesPathsAreRegistered(t *testing.T) {
 	router := newGatewayRoutesTestRouter()
 
