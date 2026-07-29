@@ -192,7 +192,7 @@ func TestSchedulerBulkAccountEventMissingAccountFallsBackToAllPlatforms(t *testi
 
 	require.NoError(t, err)
 	platforms := schedulerSnapshotPlatforms()
-	require.ElementsMatch(t, schedulerBucketsForTest([]int64{31, 32}, platforms[:]...), cache.capturedBuckets())
+	require.ElementsMatch(t, schedulerBucketsForTest([]int64{31, 32}, platforms...), cache.capturedBuckets())
 	set, deleted := cache.accountWrites()
 	require.Equal(t, []int64{3}, set)
 	require.Equal(t, []int64{4}, deleted)
@@ -207,5 +207,5 @@ func TestSchedulerBulkAccountEventUnknownPlatformFallsBackToAllPlatforms(t *test
 
 	require.NoError(t, err)
 	platforms := schedulerSnapshotPlatforms()
-	require.ElementsMatch(t, schedulerBucketsForTest([]int64{41, 42}, platforms[:]...), cache.capturedBuckets())
+	require.ElementsMatch(t, schedulerBucketsForTest([]int64{41, 42}, platforms...), cache.capturedBuckets())
 }

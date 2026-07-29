@@ -199,6 +199,12 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.testGrokAccountConnection(c, account, modelID)
 	}
 
+	// grok_search：SSO cookie 走 console.x.ai/v1/responses，认证/CF 策略与 grok 不同，
+	// 必须走独立测试方法（否则 fallthrough 到 testClaudeAccountConnection 用 SSO 打 Anthropic 必报错）。
+	if account.Platform == PlatformGrokSearch {
+		return s.testGrokSearchAccountConnection(c, account, modelID)
+	}
+
 	if account.Platform == PlatformAntigravity {
 		return s.routeAntigravityTest(c, account, modelID, prompt)
 	}
@@ -808,6 +814,130 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	}
 
 	return s.processOpenAIStream(c, resp.Body)
+}
+
+// testGrokSearchAccountConnection 测试 grok_search 账号（SSO cookie 走 console.x.ai/v1/responses）的连通性。
+//
+// 与 testGrokAccountConnection 的关键差异：
+//   - 认证：grok_search 用 SSO cookie（account.GetCredential("sso_token")），不是 access_token/api_key。
+//   - 上游 URL：自拼 base_url + grokSearchResponsesPath（绕开 buildGrokResponsesURL 白名单）。
+//   - CF 策略：必须用 grokSearchChromeProfile() 的 Chrome uTLS 指纹过 console.x.ai 的 Cloudflare
+//     （裸 httpUpstream.Do 会被 CF 403），走 DoWithTLS。
+//   - 请求构造复用 buildGrokSearchRequest（已封装 Cookie/headers/Chrome UA）+ normalizeGrokSearchRequestBody。
+//
+// 测试场景只判连通性 + 给前端反馈，不改账号状态（不触发 markGrokSearchReauthRequired /
+// tempUnscheduleGrokSearch / accountRepo —— 那是转发链路的事，测试不应污染账号状态）。
+func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, account *Account, modelID string) error {
+	ctx := c.Request.Context()
+
+	if s.httpUpstream == nil {
+		return s.sendErrorAndEnd(c, "HTTP upstream not configured")
+	}
+
+	// SSO token（console 网页态认证，sso 与 sso-rw 同值）
+	ssoToken := strings.TrimSpace(account.GetCredential("sso_token"))
+	if ssoToken == "" {
+		return s.sendErrorAndEnd(c, "grok_search account missing sso_token credential")
+	}
+
+	// base_url 缺省用 console 默认值
+	baseURL := strings.TrimSpace(account.GetCredential("base_url"))
+	if baseURL == "" {
+		baseURL = grokSearchDefaultBaseURL
+	}
+	upstreamURL := strings.TrimSuffix(baseURL, "/") + grokSearchResponsesPath
+
+	// 模型：复用 grok 系列默认（grokDefaultResponsesModel），与 forwardGrokSearch 的映射逻辑一致
+	testModelID := strings.TrimSpace(modelID)
+	if testModelID == "" {
+		testModelID = grokDefaultResponsesModel
+	}
+	if mapped := strings.TrimSpace(account.GetMappedModel(testModelID)); mapped != "" {
+		testModelID = mapped
+	}
+
+	// 最简 OpenAI Responses 请求体（非流式）。normalizeGrokSearchRequestBody 会 patchInput
+	// 把 text→input_text，并注入 web_search/x_search 等 console 契约。
+	minimalBody := map[string]any{
+		"model":  testModelID,
+		"input":  []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "hi"}}}},
+		"stream": false,
+	}
+	rawBody, _ := json.Marshal(minimalBody)
+	patchedBody, err := normalizeGrokSearchRequestBody(rawBody, testModelID)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to build grok_search test payload: %s", err.Error()))
+	}
+
+	// 设 SSE 响应头（测试 UI 统一用 SSE 推进）
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+
+	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
+
+	req, err := buildGrokSearchRequest(ctx, patchedBody, ssoToken, upstreamURL)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to create grok_search request: %s", err.Error()))
+	}
+
+	// 代理（与 forwardGrokSearch 一致）
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	// 必须用 Chrome uTLS 指纹过 CF（裸 Do 会被 CF 403），与 forwardGrokSearch 一致
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, grokSearchChromeProfile())
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("grok_search test request failed: %s", err.Error()))
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 错误：只反馈给前端，不改账号状态（测试不调 markGrokSearchReauthRequired / tempUnscheduleGrokSearch）
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return s.sendErrorAndEnd(c, fmt.Sprintf("grok_search test failed: status %d, %s",
+			resp.StatusCode, truncateString(string(body), 200)))
+	}
+
+	// 成功：尝试解析首段文本反馈给前端；解析失败不算致命，HTTP 2xx 即视为连通成功
+	body, _ := io.ReadAll(resp.Body)
+	text := extractGrokSearchResponseText(body)
+	if text == "" {
+		text = "(grok_search connected, empty response)"
+	}
+	s.sendEvent(c, TestEvent{Type: "content", Text: text})
+	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+	return nil
+}
+
+// extractGrokSearchResponseText 从 console.x.ai/v1/responses 非流式 JSON 响应中提取首段文本。
+// 响应形如 {"output":[{"content":[{"type":"output_text","text":"..."}]}]}，提取失败返回空串。
+func extractGrokSearchResponseText(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var resp struct {
+		Output []struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ""
+	}
+	for _, out := range resp.Output {
+		for _, part := range out.Content {
+			if part.Text != "" {
+				return part.Text
+			}
+		}
+	}
+	return ""
 }
 
 // testOpenAIChatCompletionsConnection tests an OpenAI-compatible APIKey account

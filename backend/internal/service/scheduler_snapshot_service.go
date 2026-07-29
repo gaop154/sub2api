@@ -558,7 +558,7 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 		rebuildGroupIDs = append(rebuildGroupIDs, gid)
 	}
 
-	// 缺失账户无法确定原平台，保留五平台重建以避免遗留旧快照。
+	// 缺失账户无法确定原平台，保留全平台重建以避免遗留旧快照。
 	if !allAccountsFound {
 		return s.rebuildByGroupIDs(ctx, rebuildGroupIDs, "account_bulk_change", seen)
 	}
@@ -580,7 +580,7 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 		}
 		accountGroupIDs := s.normalizeGroupIDs(account.GroupIDs)
 		switch account.Platform {
-		case PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformGrok:
+		case PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformGrok, PlatformGrokSearch:
 			addPlatformGroups(account.Platform, accountGroupIDs)
 		case PlatformAntigravity:
 			// 批量更新可能刚关闭 mixed_scheduling，仍需清理两个兼容平台的旧快照。
@@ -795,8 +795,10 @@ func (s *SchedulerSnapshotService) rebuildByAccount(ctx context.Context, account
 	return s.rebuildBuckets(ctx, buckets, reason)
 }
 
-func schedulerSnapshotPlatforms() [5]string {
-	return [5]string{PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformAntigravity, PlatformGrok}
+func schedulerSnapshotPlatforms() []string {
+	// 不在此列表的平台的账号永远进不了调度器可选池——全量重建 schedulerCanonicalBuckets
+	// 与增量 rebuildByGroupIDs 都遍历它。grok_search 必须在此，否则建号/关联分组后请求仍选不到账号。
+	return []string{PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformAntigravity, PlatformGrok, PlatformGrokSearch}
 }
 
 // 生命周期辅助函数有意排除 group0；full rebuild 构造 group0 canonical 集时必须显式调用 canonical helper。

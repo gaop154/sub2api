@@ -12,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
 const upstreamModelsBodyLimit int64 = 8 << 20
@@ -79,6 +80,13 @@ func (s *AccountTestService) FetchUpstreamSupportedModels(ctx context.Context, a
 	}
 	if account == nil {
 		return nil, newUpstreamModelSyncConfigError("Account is required", nil)
+	}
+
+	// grok_search 走 console.x.ai 网页态（SSO cookie），无标准 /v1/models 端点。
+	// 同步上游模型直接返回静态 xAI 模型列表（与 grok 平台一致），不打上游——
+	// 避免对不存在的端点发请求而 404/403。模型集与 defaultModelsListCandidateIDs 一致。
+	if account.Platform == PlatformGrokSearch {
+		return xai.DefaultModelIDs(), nil
 	}
 
 	if account.Platform == PlatformAntigravity && account.Type != AccountTypeAPIKey {
