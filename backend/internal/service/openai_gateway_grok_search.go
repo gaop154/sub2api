@@ -115,9 +115,14 @@ func (s *OpenAIGatewayService) forwardGrokSearch(
 	if strings.TrimSpace(upstreamModel) == "" {
 		upstreamModel = originalModel
 	}
+	// 识别 effort 后缀：部分客户端（如 smart Research）只能填模型名、无法单独传 reasoning.effort，
+	// 允许用「真模型名 + -xhigh 等」表达 Agent 协同强度。剥离后缀得到真模型名，
+	// 并把 effort 作为归一化优先值注入 reasoning.effort（客户端显式 effort 仍优先于后缀值）。
+	baseModel, effortFromSuffix := splitGrokSearchEffortSuffix(upstreamModel)
+	upstreamModel = baseModel
 
 	// 3. body 施加 console 契约
-	patchedBody, err := normalizeGrokSearchRequestBody(body, upstreamModel)
+	patchedBody, err := normalizeGrokSearchRequestBody(body, upstreamModel, effortFromSuffix)
 	if err != nil {
 		return nil, fmt.Errorf("normalize grok_search request body: %w", err)
 	}
@@ -243,11 +248,12 @@ const grokSearchDefaultMaxOutputTokens = 2_000_000
 //   - 删 metadata/previous_response_id/service_tier/prompt_cache_key/background/conversation。
 //   - patchInput：text/output_text → input_text；image_url → input_image（展平 url）。
 //   - max_output_tokens 缺省补 multi-agent 默认。
-//   - reasoning.effort 归一（minimal/max 等 → console 档位），缺省 medium。
+//   - reasoning.effort 归一（minimal/max 等 → console 档位），缺省 medium；preferredEffort
+//     为模型名 effort 后缀剥离值（见 splitGrokSearchEffortSuffix），客户端未显式带 effort 时生效。
 //   - include 补 reasoning.encrypted_content（multi-agent 链路需要）。
 //   - tools 归一 + 注入 web_search/x_search（multi-agent 搜索能力）。
 //   - tool_choice 缺省 auto。
-func normalizeGrokSearchRequestBody(body []byte, upstreamModel string) ([]byte, error) {
+func normalizeGrokSearchRequestBody(body []byte, upstreamModel string, preferredEffort string) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
 	}
@@ -264,7 +270,7 @@ func normalizeGrokSearchRequestBody(body []byte, upstreamModel string) ([]byte, 
 	if _, exists := payload["max_output_tokens"]; !exists {
 		payload["max_output_tokens"] = grokSearchDefaultMaxOutputTokens
 	}
-	normalizeGrokSearchReasoning(payload)
+	normalizeGrokSearchReasoning(payload, preferredEffort)
 	ensureGrokSearchReasoningInclude(payload)
 	normalizeGrokSearchTools(payload)
 	if _, exists := payload["tool_choice"]; !exists {
@@ -308,16 +314,21 @@ func patchGrokSearchInput(payload map[string]any) {
 	}
 }
 
-// normalizeGrokSearchReasoning 归一 reasoning.effort，缺省 medium（multi-agent 默认档）。
-func normalizeGrokSearchReasoning(payload map[string]any) {
+// normalizeGrokSearchReasoning 归一 reasoning.effort。
+// 优先级：客户端请求体显式带的 effort > preferredEffort（模型名后缀剥离值）> 默认 medium。
+// multi-agent 默认档为 medium；preferredEffort 让「真模型名 + effort 后缀」的写法生效。
+func normalizeGrokSearchReasoning(payload map[string]any, preferredEffort string) {
 	reasoning, _ := payload["reasoning"].(map[string]any)
 	if reasoning == nil {
 		reasoning = map[string]any{}
 	}
 	effort, _ := reasoning["effort"].(string)
-	effort = normalizeGrokSearchEffort(effort)
+	effort = normalizeGrokSearchEffort(effort) // 客户端显式带的优先
 	if effort == "" {
-		effort = "medium"
+		effort = normalizeGrokSearchEffort(preferredEffort) // 模型名后缀剥离值次之
+	}
+	if effort == "" {
+		effort = "medium" // 最后兜底默认 medium（multi-agent 默认档）
 	}
 	reasoning["effort"] = effort
 	payload["reasoning"] = reasoning
@@ -338,6 +349,49 @@ func normalizeGrokSearchEffort(v string) string {
 	default:
 		return ""
 	}
+}
+
+// splitGrokSearchEffortSuffix 从模型名末尾识别 reasoning effort 后缀
+// （-low/-medium/-high/-xhigh/-max），返回剥离后缀的真实模型名与对应的 effort
+// （无后缀、后缀非法、或剥离后 base 为空时 effort 返回空串）。
+//
+// 背景：部分客户端（如 smart Research）只能填模型名、无法单独传 reasoning.effort。
+// 允许用「真模型名 + effort 后缀」表达 multi-agent 协同强度，例如
+// grok-4.20-multi-agent-0309-xhigh → 模型 grok-4.20-multi-agent-0309 + reasoning.effort=xhigh。
+//
+// 规则：
+//   - 大小写不敏感识别后缀（grok-...-XHIGH 同样生效），但剥离时保留 base 前缀的原始大小写。
+//   - 从长到短匹配，避免 -high 误吃 -xhigh 等（各后缀虽以 '-' 开头天然不冲突，仍保持防御性顺序）。
+//   - 后缀必须是 normalizeGrokSearchEffort 认识的 low/medium/high/xhigh(max) 之一才剥离；
+//     none 不作为后缀支持（none 是显式关闭推理的特殊值，不该用模型名后缀表达）。
+//   - 剥离后 base 必须非空（不能整个模型名就是后缀）。
+func splitGrokSearchEffortSuffix(model string) (baseModel string, effort string) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return trimmed, ""
+	}
+	// 从长到短：-medium(7) > -xhigh(6) > -high(5) > -low/-max(4)。
+	suffixes := []string{"-medium", "-xhigh", "-high", "-low", "-max"}
+	lower := strings.ToLower(trimmed)
+	for _, sfx := range suffixes {
+		if !strings.HasSuffix(lower, sfx) {
+			continue
+		}
+		idx := len(trimmed) - len(sfx)
+		if idx <= 0 {
+			// 整串就是后缀，base 为空，不剥离
+			continue
+		}
+		base := trimmed[:idx]
+		// 跳过前导 '-'，取 effort 词交给 normalize 判定合法性（normalize 不识别带 '-' 的串）
+		effortWord := trimmed[idx+1:]
+		normalized := normalizeGrokSearchEffort(effortWord)
+		if normalized == "" || normalized == "none" {
+			continue
+		}
+		return base, normalized
+	}
+	return trimmed, ""
 }
 
 // ensureGrokSearchReasoningInclude 保证 include 含 reasoning.encrypted_content。
@@ -530,6 +584,10 @@ func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
 	if mapped := account.GetMappedModel(originalModel); strings.TrimSpace(mapped) != "" {
 		upstreamModel = mapped
 	}
+	// 识别 effort 后缀（与 forwardGrokSearch 同源）：剥离后得到真模型名 + 优先 effort。
+	// 注意：剥离只影响发给上游的 upstreamModel 与 reasoning.effort，不影响 billingModel 计费。
+	baseModel, effortFromSuffix := splitGrokSearchEffortSuffix(upstreamModel)
+	upstreamModel = baseModel
 
 	// 2. chat body → responses body
 	responsesReq, err := apicompat.ChatCompletionsToResponses(&chatReq)
@@ -548,7 +606,7 @@ func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
 
 	// 3. 施加 console 契约（store=false、删 metadata/service_tier 等、tools 注入 web_search/x_search、
 	// include 补 reasoning.encrypted_content、reasoning.effort 归一）——与 forwardGrokSearch 同源。
-	responsesBody, err = normalizeGrokSearchRequestBody(responsesBody, upstreamModel)
+	responsesBody, err = normalizeGrokSearchRequestBody(responsesBody, upstreamModel, effortFromSuffix)
 	if err != nil {
 		return nil, fmt.Errorf("normalize grok_search chat bridge request body: %w", err)
 	}

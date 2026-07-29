@@ -878,7 +878,8 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 		"stream": false,
 	}
 	rawBody, _ := json.Marshal(minimalBody)
-	patchedBody, err := normalizeGrokSearchRequestBody(rawBody, testModelID)
+	// 连通性测试不识别 effort 后缀（测试模型为真实模型 ID，preferredEffort 传空走默认 medium 档）。
+	patchedBody, err := normalizeGrokSearchRequestBody(rawBody, testModelID, "")
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to build grok_search test payload: %s", err.Error()))
 	}
