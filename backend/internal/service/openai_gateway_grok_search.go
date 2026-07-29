@@ -13,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
+	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -477,12 +478,15 @@ func getStringFromMap(m map[string]any, key string) string {
 // （handleGrokAccountUpstreamError）物理隔离：不解析 grok OIDC 配额快照、不触发 402→账号冷却
 // （grok_search 的目标正是绕开 402；若 console 仍返回 402，按未知错误透传，不冷却账号）。
 //
-// 策略（PoC，design §8/§9）：
-//   - 401：SSO 失效，短时冷却并标记需重认证（无 refresh，管理员重导 SSO）。
-//   - 429：限流冷却。
+// 策略（design §2 状态码决策树）：
+//   - 401：SSO 失效，持久标记需重认证（无 refresh，管理员重导 SSO）。
+//   - 403：CF 挑战 → 不惩罚账号（出口/指纹问题）；SSO 权限失效 → 同 401 重认证；其它 → 不特殊处理。
+//   - 429：CF 挑战 → 不惩罚账号；免费额度耗尽 → 长冷却 24h；普通瞬时频率限制 → 短退避 5min。
 //   - 5xx：非池模式下短冷却。
-//   - 403：疑似 CF 挑战 / egress 拦截，PoC 不惩罚账号（L1 实证后再定）。
 //   - 其余：不冷却，仅由调用方透传错误。
+//
+// 判定顺序关键：CF 判定必须最前——IsCloudflareChallengeResponse 对 403 和 429 都会命中
+// （CF 挑战可能以 403 或 429 形态出现），CF 是出口/指纹问题，绝不能当账号额度/权限问题去冷却或失效账号。
 func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
 	if s == nil || account == nil {
 		return
@@ -492,15 +496,67 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 		// SSO 无 refresh，失效只能重导：持久标记需重认证（status=error + schedulable=false），
 		// 不用 temp 短时冷却（会 401 循环——10 分钟后恢复调度又用失效 SSO 打）。管理员重导 SSO 后账号恢复 active。
 		s.markGrokSearchReauthRequired(ctx, account)
+	case http.StatusForbidden:
+		// CF 挑战最优先：console.x.ai 在 Cloudflare 后，403 常为出口/指纹问题而非账号问题，
+		// 绝不能当账号额度/权限问题去冷却或失效账号。不惩罚账号，交由上层既有机制处理。
+		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
+			return
+		}
+		// SSO 权限丢失（console 权限拒绝）：同 401 处理，需管理员重导 SSO。
+		if isGrokSearchPermissionDenied(responseBody) {
+			s.markGrokSearchReauthRequired(ctx, account)
+			return
+		}
+		// 其它 403：不特殊处理（保持 default 语义，不冷却不失效）
 	case http.StatusTooManyRequests:
-		s.tempUnscheduleGrokSearch(ctx, account, 5*time.Minute, "grok_search rate limited")
+		// CF 挑战可能伪装成 429，最优先排除，不惩罚账号（避免把出口问题误判为额度/频率问题去冷却账号）
+		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
+			return
+		}
+		// 免费额度耗尽（非瞬时频率限制）：长冷却 24h，避免 5min 恢复后又 429 的无效循环。
+		// console 网页订阅免费额度按周期重置，对齐 grok2api defaultFreeQuotaRecoveryPause。
+		if isGrokSearchFreeQuotaExhausted(responseBody) {
+			s.tempUnscheduleGrokSearch(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
+			return
+		}
+		// 普通瞬时频率限制：短退避（保持原有行为）
+		s.tempUnscheduleGrokSearch(ctx, account, grokSearchRateLimitCooldown, "grok_search rate limited")
 	default:
 		if statusCode >= 500 && !account.IsPoolMode() {
 			s.tempUnscheduleGrokSearch(ctx, account, 2*time.Minute, "grok_search upstream temporary error")
 		}
 	}
-	_ = responseBody
-	_ = headers
+}
+
+// grok_search 错误处理冷却时长。
+const (
+	// grokSearchFreeQuotaCooldown：console 网页订阅"免费额度耗尽"冷却时长。
+	// 该错误本质是免费配额按周期耗尽（非瞬时频率限制），短冷却（5min）无效——
+	// 恢复调度后又 429，形成无效循环。固定 24h 对齐 grok2api defaultFreeQuotaRecoveryPause，
+	// 确定可预期（console 该错误可能不带 Retry-After，本期不增加配置项）。
+	grokSearchFreeQuotaCooldown = 24 * time.Hour
+	// grokSearchRateLimitCooldown：普通瞬时频率限制（RPS 等）的短退避，保持原有 5min 行为。
+	grokSearchRateLimitCooldown = 5 * time.Minute
+)
+
+// isGrokSearchFreeQuotaExhausted 识别 console 免费额度耗尽的 429 响应。
+// 实测 body 形如：{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits..."}。
+//
+// 注意：不单看 code:resource-exhausted——grok2api 经验显示 console 的 RPS 速率限流也是这个 code
+// （其 error 文本为 "Too many requests for team... Requests per Second"）。单看 code 会把 RPS 限流
+// 误判成额度耗尽、走 24h 长冷却（实际只需 5min）。这里用 error 文本 "free usage quota" 精确区分，
+// 大小写不敏感。
+func isGrokSearchFreeQuotaExhausted(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "free usage quota")
+}
+
+// isGrokSearchPermissionDenied 识别 console SSO 权限失效的 403 响应（参照 grok2api permanent denial 语义）。
+// 命中即视为 SSO 权限丢失（与 401 同处理，需管理员重导 SSO）。大小写不敏感。
+func isGrokSearchPermissionDenied(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "permission-denied") ||
+		strings.Contains(lower, "permission_denied") ||
+		strings.Contains(lower, "access to the chat endpoint is denied")
 }
 
 // tempUnscheduleGrokSearch 临时下线 grok_search 账号（结构同 tempUnscheduleGrok，独立 reason）。
