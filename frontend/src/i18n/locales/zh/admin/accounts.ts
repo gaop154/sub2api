@@ -655,7 +655,10 @@ export default {
         ssoRequired: '请输入 SSO token',
         baseUrlLabel: 'Console Base URL',
         baseUrlPlaceholder: 'https://console.x.ai',
-        baseUrlHint: '默认 https://console.x.ai，仅当通过自建代理转发 console 时才需修改。'
+        baseUrlHint: '默认 https://console.x.ai，仅当通过自建代理转发 console 时才需修改。',
+        chatCompletionsLabel: '允许 /v1/chat/completions',
+        chatCompletionsHint:
+          'grok_search 上游为 responses 格式，默认仅支持 /v1/responses。开启后网关会把 chat completions 请求桥接转码为 responses 转发并转回 chat 格式响应。'
       },
       anthropic: {
         apiKeyPassthrough: '自动透传（仅替换认证）',

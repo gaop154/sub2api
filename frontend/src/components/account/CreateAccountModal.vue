@@ -1615,6 +1615,24 @@
             />
             <p class="input-hint">{{ t('admin.accounts.grokSearch.baseUrlHint') }}</p>
           </div>
+
+          <!-- Chat Completions 桥接开关：grok_search 上游是 responses 格式，
+               默认仅支持 /v1/responses；开启后额外支持 /v1/chat/completions（网关做 chat↔responses 转换） -->
+          <div class="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3 dark:bg-gray-700/50">
+            <div class="flex-1">
+              <label class="text-sm font-semibold text-gray-700 dark:text-gray-300">
+                {{ t('admin.accounts.grokSearch.chatCompletionsLabel') }}
+              </label>
+              <p class="mt-0.5 text-xs text-slate-600 dark:text-slate-400">
+                {{ t('admin.accounts.grokSearch.chatCompletionsHint') }}
+              </p>
+            </div>
+            <Toggle
+              v-model="grokSearchChatCompletionsEnabled"
+              data-testid="grok-search-chat-completions-toggle"
+              :aria-label="t('admin.accounts.grokSearch.chatCompletionsLabel')"
+            />
+          </div>
         </div>
       </div>
 
@@ -3789,6 +3807,10 @@ const upstreamBillingAutoProbeEnabled = ref(true)
 // Grok Search（console.x.ai SSO 通道）专用状态：单账号 SSO token + base_url
 const grokSearchSsoToken = ref('')
 const grokSearchBaseUrl = ref('https://console.x.ai')
+// 是否启用 /v1/chat/completions 桥接（账号 Extra grok_search_chat_completions）。
+// 默认关闭：grok_search 上游是 responses 格式，仅支持 /v1/responses；
+// 开启后网关把 chat completions 转成 responses 转发并转回 chat 响应。
+const grokSearchChatCompletionsEnabled = ref(false)
 
 const syncPreviewCredentials = computed(() => {
   if (!apiKeyValue.value) return undefined
@@ -4319,6 +4341,7 @@ watch(
       addMethod.value = 'oauth'
       grokSearchSsoToken.value = ''
       grokSearchBaseUrl.value = 'https://console.x.ai'
+      grokSearchChatCompletionsEnabled.value = false
     }
     if (newPlatform !== 'gemini' && newPlatform !== 'anthropic' && accountCategory.value === 'service_account') {
       accountCategory.value = 'oauth-based'
@@ -4740,6 +4763,7 @@ const resetForm = () => {
   // 重置 Grok Search SSO 状态
   grokSearchSsoToken.value = ''
   grokSearchBaseUrl.value = 'https://console.x.ai'
+  grokSearchChatCompletionsEnabled.value = false
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
   editQuotaWeeklyLimit.value = null
@@ -5189,7 +5213,11 @@ const handleSubmit = async () => {
       sso_token: grokSearchSsoToken.value,
       base_url: grokSearchBaseUrl.value.trim() || 'https://console.x.ai'
     }
-    const extra = buildAnthropicExtra(buildOpenAIExtra())
+    // grok_search 的 Extra：仅 chat completions 桥接开关（其他平台的 extra 字段对 grok_search 无意义）
+    const extra: Record<string, unknown> = {}
+    if (grokSearchChatCompletionsEnabled.value) {
+      extra.grok_search_chat_completions = true
+    }
     await doCreateAccount({
       ...form,
       group_ids: form.group_ids,

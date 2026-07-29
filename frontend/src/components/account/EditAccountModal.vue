@@ -26,8 +26,8 @@
         <p class="input-hint">{{ t('admin.accounts.notesHint') }}</p>
       </div>
 
-      <!-- API Key fields (only for apikey type) -->
-      <div v-if="account.type === 'apikey'" class="space-y-4">
+      <!-- API Key fields (only for apikey type, excluding grok_search which has its own SSO fields) -->
+      <div v-if="account.type === 'apikey' && account.platform !== 'grok_search'" class="space-y-4">
         <div>
           <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
           <input
@@ -486,6 +486,72 @@
             :placeholder="t('admin.accounts.grokCustomBaseUrl.placeholder')"
           />
           <GrokBaseUrlPresets @select="grokOAuthBaseUrl = $event" />
+        </div>
+      </div>
+
+      <!-- Grok Search 凭证编辑（console.x.ai SSO cookie 通道，独立于 grok OAuth） -->
+      <div
+        v-if="account.platform === 'grok_search'"
+        class="space-y-4 border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div
+          class="rounded-lg border border-slate-300 bg-white/80 p-4 dark:border-slate-600 dark:bg-gray-800/80"
+        >
+          <p class="mb-3 text-sm text-slate-700 dark:text-slate-300">
+            {{ t('admin.accounts.grokSearch.ssoDesc') }}
+          </p>
+
+          <!-- SSO token（密码态，留空不改，与 api_key 编辑范式一致） -->
+          <div class="mb-4">
+            <label class="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-300">
+              <Icon name="key" size="sm" class="text-slate-500" />
+              {{ t('admin.accounts.grokSearch.ssoLabel') }}
+            </label>
+            <input
+              v-model="grokSearchSsoToken"
+              type="password"
+              class="input w-full font-mono text-sm"
+              :placeholder="t('admin.accounts.grokSearch.ssoPlaceholder')"
+              autocomplete="new-password"
+              data-1p-ignore
+              data-lpignore="true"
+              data-bwignore="true"
+              spellcheck="false"
+            />
+            <p class="mt-1 text-xs text-slate-600 dark:text-slate-400">
+              {{ t('admin.accounts.grokSearch.ssoHint') }}
+            </p>
+          </div>
+
+          <!-- base_url 输入（默认 console.x.ai） -->
+          <div class="mb-4">
+            <label class="input-label">{{ t('admin.accounts.grokSearch.baseUrlLabel') }}</label>
+            <input
+              v-model="grokSearchBaseUrl"
+              type="text"
+              class="input"
+              :placeholder="t('admin.accounts.grokSearch.baseUrlPlaceholder')"
+            />
+            <p class="input-hint">{{ t('admin.accounts.grokSearch.baseUrlHint') }}</p>
+          </div>
+
+          <!-- Chat Completions 桥接开关：grok_search 上游是 responses 格式，
+               默认仅支持 /v1/responses；开启后网关把 chat completions 转成 responses 转发并转回 chat 响应 -->
+          <div class="flex items-center justify-between gap-3 rounded-lg bg-slate-50 p-3 dark:bg-gray-700/50">
+            <div class="flex-1">
+              <label class="text-sm font-semibold text-gray-700 dark:text-gray-300">
+                {{ t('admin.accounts.grokSearch.chatCompletionsLabel') }}
+              </label>
+              <p class="mt-0.5 text-xs text-slate-600 dark:text-slate-400">
+                {{ t('admin.accounts.grokSearch.chatCompletionsHint') }}
+              </p>
+            </div>
+            <Toggle
+              v-model="grokSearchChatCompletionsEnabled"
+              data-testid="grok-search-chat-completions-toggle"
+              :aria-label="t('admin.accounts.grokSearch.chatCompletionsLabel')"
+            />
+          </div>
         </div>
       </div>
 
@@ -2828,6 +2894,13 @@ const grokOAuthBaseUrl = ref('')
 // explicit false in the account extra as the opt-out signal.
 const grokClientToolCacheEnabled = ref(true)
 
+// Grok Search（console.x.ai SSO 通道）编辑态：SSO token + base_url + chat completions 桥接。
+// SSO token 编辑语义与 api_key 一致：留空不改（后端可能脱敏，回填留空让用户重填）。
+const grokSearchSsoToken = ref('')
+const grokSearchBaseUrl = ref('https://console.x.ai')
+// 是否启用 /v1/chat/completions 桥接（账号 Extra grok_search_chat_completions）。
+const grokSearchChatCompletionsEnabled = ref(false)
+
 const interceptWarmupRequests = ref(false)
 const autoPauseOnExpired = ref(false)
 const autoPause5hThreshold = ref<number | null>(null)
@@ -3509,6 +3582,21 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
   }
 
+  // Load Grok Search SSO state（console.x.ai SSO 通道）
+  // SSO token 视同敏感凭证：留空不改，与 api_key 编辑范式一致。
+  grokSearchSsoToken.value = ''
+  grokSearchBaseUrl.value = 'https://console.x.ai'
+  grokSearchChatCompletionsEnabled.value = false
+  if (newAccount.platform === 'grok_search' && newAccount.credentials) {
+    const gsCreds = newAccount.credentials as Record<string, unknown>
+    const storedBaseUrl = (gsCreds.base_url as string) || ''
+    grokSearchBaseUrl.value = storedBaseUrl.trim() || 'https://console.x.ai'
+  }
+  if (newAccount.platform === 'grok_search') {
+    const gsExtra = (newAccount.extra as Record<string, unknown>) || {}
+    grokSearchChatCompletionsEnabled.value = gsExtra.grok_search_chat_completions === true
+  }
+
   // Initialize API Key fields for apikey type
   if (newAccount.type === 'apikey' && newAccount.credentials) {
     const credentials = newAccount.credentials as Record<string, unknown>
@@ -4107,7 +4195,8 @@ const handleSubmit = async () => {
     updatePayload.auto_pause_on_expired = autoPauseOnExpired.value
 
     // For apikey type, handle credentials update
-    if (props.account.type === 'apikey') {
+    // grok_search 走专用 SSO 凭证分支，不进通用 apikey 处理（无 api_key/model_mapping 等字段）
+    if (props.account.type === 'apikey' && props.account.platform !== 'grok_search') {
       const currentCredentials = (props.account.credentials as Record<string, unknown>) || {}
       const newBaseUrl = editBaseUrl.value.trim() || defaultBaseUrl.value
       const shouldApplyModelMapping = !(props.account.platform === 'openai' && openaiPassthroughEnabled.value)
@@ -4403,6 +4492,30 @@ const handleSubmit = async () => {
       const currentCredentials = (updatePayload.credentials as Record<string, unknown>) ||
         ((props.account.credentials as Record<string, unknown>) || {})
       updatePayload.credentials = applyPlanType({ ...currentCredentials }, editPlanType.value)
+    }
+
+    // Grok Search：SSO cookie 凭证 + chat completions 桥接开关。
+    // sso_token 留空不改（与 api_key 编辑范式一致）；base_url 始终写入。
+    // extra 合并现有值后写入 grok_search_chat_completions（关闭则删除 key）。
+    if (props.account.platform === 'grok_search') {
+      const currentCredentials = (props.account.credentials as Record<string, unknown>) || {}
+      const newCredentials: Record<string, unknown> = { ...currentCredentials }
+      const trimmedSsoToken = grokSearchSsoToken.value.trim()
+      if (trimmedSsoToken) {
+        newCredentials.sso_token = trimmedSsoToken
+      }
+      newCredentials.base_url = grokSearchBaseUrl.value.trim() || 'https://console.x.ai'
+      updatePayload.credentials = newCredentials
+
+      const currentExtra = (updatePayload.extra as Record<string, unknown>) ||
+        (props.account.extra as Record<string, unknown>) || {}
+      const newExtra: Record<string, unknown> = { ...currentExtra }
+      if (grokSearchChatCompletionsEnabled.value) {
+        newExtra.grok_search_chat_completions = true
+      } else {
+        delete newExtra.grok_search_chat_completions
+      }
+      updatePayload.extra = newExtra
     }
 
     // Antigravity: persist model mapping to credentials (applies to all antigravity types)

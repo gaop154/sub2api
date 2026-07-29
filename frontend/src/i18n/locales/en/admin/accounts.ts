@@ -595,7 +595,10 @@ export default {
         ssoRequired: 'Please enter the SSO token',
         baseUrlLabel: 'Console Base URL',
         baseUrlPlaceholder: 'https://console.x.ai',
-        baseUrlHint: 'Defaults to https://console.x.ai. Only change if you proxy the console endpoint.'
+        baseUrlHint: 'Defaults to https://console.x.ai. Only change if you proxy the console endpoint.',
+        chatCompletionsLabel: 'Allow /v1/chat/completions',
+        chatCompletionsHint:
+          'grok_search upstream uses responses format and only supports /v1/responses by default. When enabled, the gateway bridges chat completions requests to responses and converts the response back to chat format.'
       },
       anthropic: {
         apiKeyPassthrough: 'Auto passthrough (auth only)',
