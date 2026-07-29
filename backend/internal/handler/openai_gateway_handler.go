@@ -163,13 +163,17 @@ func wrapUsageRecordTaskContext(parent context.Context, task service.UsageRecord
 
 func openAICompatibleRequestPlatform(ctx context.Context, apiKey *service.APIKey) string {
 	if platform, ok := service.ResolvedTargetPlatformFromContext(ctx); ok {
-		if platform == service.PlatformGrok {
-			return service.PlatformGrok
+		if platform == service.PlatformGrok || platform == service.PlatformGrokSearch {
+			return platform
 		}
 		return service.PlatformOpenAI
 	}
-	if apiKey != nil && apiKey.Group != nil && apiKey.Group.Platform == service.PlatformGrok {
-		return service.PlatformGrok
+	if apiKey != nil && apiKey.Group != nil {
+		// grok_search 与 grok 一样保持平台自身，不能归一成 PlatformOpenAI，
+		// 否则选号时按 openai 平台查桶取不到 grok_search 账号（pool=0）。
+		if apiKey.Group.Platform == service.PlatformGrok || apiKey.Group.Platform == service.PlatformGrokSearch {
+			return apiKey.Group.Platform
+		}
 	}
 	return service.PlatformOpenAI
 }
