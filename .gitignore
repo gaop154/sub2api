@@ -123,6 +123,9 @@ CLAUDE.md
 scripts
 !backend/scripts/
 !backend/scripts/resolve-version.sh
+# trellis 工作流脚本（团队/多机器共用），被上方裸名 scripts 规则误伤，此处放行
+!.trellis/scripts/
+!.trellis/scripts/**
 .code-review-state
 #openspec/
 code-reviews/
@@ -143,4 +146,3 @@ docs/*
 frontend/coverage/
 aicodex
 output/
-.trellis
