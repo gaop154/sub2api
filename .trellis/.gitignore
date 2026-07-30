@@ -30,3 +30,7 @@
 # Python cache
 **/__pycache__/
 **/*.pyc
+
+# Trellis tool local state: version pin + template hashes change on `trellis update`
+.version
+.template-hashes.json
