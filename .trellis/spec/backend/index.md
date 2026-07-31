@@ -21,6 +21,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Upstream Egress & TLS Fingerprint](./upstream-egress.md) | httpUpstream 出口层 + CF/uTLS 指纹应对 | Filled |
 | [New Platform Onboarding](./new-platform.md) | 新平台落地的隔离模式 + platform CHECK 现状 | Filled |
+| [grok vs grok_search 路径隔离](./grok-paths-isolation.md) | 两条 grok 路径的通道隔离/额度共享/重置冷却/测试副作用边界 | Filled |
 
 ---
 
