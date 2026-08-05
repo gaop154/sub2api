@@ -132,20 +132,17 @@ func (s *OpenAIGatewayService) forwardGrokSearch(
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	defer releaseUpstreamCtx()
 
-	req, err := buildGrokSearchRequest(upstreamCtx, patchedBody, ssoToken, upstreamURL)
-	if err != nil {
-		return nil, err
-	}
-
 	// 5. 代理
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
 
-	// 6. 发送（CF 策略 L1：Chrome uTLS 指纹 + 一致 headers）
-	// 实证（cfprobe）：裸 Go TLS 被 CF 403 拦截；Chrome 指纹绕过 CF、应用层返回 SSO 错误。
-	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, grokSearchChromeProfile())
+	// 6. 发送（DPoP proof + 401 自动重试）
+	// 用 doGrokSearchDPoPRequest 替换 buildGrokSearchRequest + DoWithTLS，
+	// 内部处理 DPoP token 交换、proof 注入、401 重试一次。
+	resp, err := s.doGrokSearchDPoPRequest(upstreamCtx, account, ssoToken, proxyURL,
+		http.MethodPost, upstreamURL, patchedBody, "*/*")
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
@@ -502,6 +499,13 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
 			return
 		}
+		// DPoP proof 缺失/无效（协议层异常）：不惩罚账号（SSO 仍有效），告警日志。
+		// 正常实现后不应出现；出现即实现 bug 或上游契约变更，需人工排查。
+		if isGrokSearchDPoPRequired(responseBody) {
+			logger.LegacyPrintf("service.openai_gateway_grok_search",
+				"grok_search DPoP required account_id=%d (proof missing/invalid or upstream contract changed)", account.ID)
+			return
+		}
 		// SSO 权限丢失（console 权限拒绝）：同 401 处理，需管理员重导 SSO。
 		if isGrokSearchPermissionDenied(responseBody) {
 			s.markGrokSearchReauthRequired(ctx, account)
@@ -557,6 +561,46 @@ func isGrokSearchPermissionDenied(body []byte) bool {
 	return strings.Contains(lower, "permission-denied") ||
 		strings.Contains(lower, "permission_denied") ||
 		strings.Contains(lower, "access to the chat endpoint is denied")
+}
+
+// isGrokSearchDPoPRequired 识别 console DPoP proof 缺失/无效的 403 响应。
+// 命中即视为协议层异常（实现 bug 或上游契约变更），**不惩罚账号**（SSO 仍有效）。
+// 正常实现后不应出现；出现即告警信号，需人工排查。大小写不敏感。
+func isGrokSearchDPoPRequired(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "dpop-required") ||
+		strings.Contains(lower, "dpop proof required")
+}
+
+// isGrokSearchUnauthorized 识别 console 未授权错误（SSO 有效但权限/登录态不足）。
+// 用于 /dpop/token 端点返回"未授权"时标记需重认证（同 SSO 失效，重导合规 SSO）。
+// 不当临时错误重试（权限问题重试无效）。大小写不敏感。
+func isGrokSearchUnauthorized(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	// 排除 CF 挑战（常见标记）
+	cfMarkers := []string{
+		"window._cf_chl_opt",
+		"just a moment",
+		"enable javascript and cookies to continue",
+		"__cf_chl_",
+		"challenge-platform",
+		"cloudflare",
+	}
+	for _, marker := range cfMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	// 排除 dpop-required / permission-denied（已有专门分支）
+	if isGrokSearchDPoPRequired(body) {
+		return false
+	}
+	if isGrokSearchPermissionDenied(body) {
+		return false
+	}
+	// 匹配"unauthorized"/"not authorized"等未授权关键字
+	return strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "not authorized")
 }
 
 // tempUnscheduleGrokSearch 临时下线 grok_search 账号（结构同 tempUnscheduleGrok，独立 reason）。
@@ -681,11 +725,6 @@ func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
 	// 5. 解耦客户端 context（客户端断开后上游仍可跑完用于计费/日志）
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	defer releaseUpstreamCtx()
-	req, err := buildGrokSearchRequest(upstreamCtx, responsesBody, ssoToken, upstreamURL)
-	if err != nil {
-		return nil, err
-	}
-	SetActualOpenAIUpstreamEndpoint(c, grokSearchResponsesPath)
 
 	// 6. 代理
 	proxyURL := ""
@@ -693,8 +732,12 @@ func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
 		proxyURL = account.Proxy.URL()
 	}
 
-	// 7. 发送（CF 策略 L1：Chrome uTLS 指纹 + 一致 headers，与 forwardGrokSearch 同源）
-	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, grokSearchChromeProfile())
+	// 7. 发送（DPoP proof + 401 自动重试）
+	// 用 doGrokSearchDPoPRequest 替换 buildGrokSearchRequest + DoWithTLS，
+	// 内部处理 DPoP token 交换、proof 注入、401 重试一次。
+	SetActualOpenAIUpstreamEndpoint(c, grokSearchResponsesPath)
+	resp, err := s.doGrokSearchDPoPRequest(upstreamCtx, account, ssoToken, proxyURL,
+		http.MethodPost, upstreamURL, responsesBody, "*/*")
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}

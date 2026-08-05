@@ -82,6 +82,7 @@ func TestForwardGrokSearchChatCompletions_DisabledRejects400(t *testing.T) {
 	}
 	upstream := &httpUpstreamRecorder{}
 	svc := &OpenAIGatewayService{
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 		httpUpstream: upstream,
 	}
 
@@ -116,9 +117,27 @@ func TestForwardGrokSearchChatCompletions_EnabledBridgesViaConsoleResponses(t *t
 	c.Set("api_key", &APIKey{ID: 8201})
 
 	account := grokSearchChatBridgeTestAccount(82)
-	upstream := &httpUpstreamRecorder{resp: grokSearchChatBridgeCompletedResponse("resp_grok_search_chat")}
+
+	// DPoP token 交换响应（模拟 console.x.ai /v1/dpop/token 成功）
+	dpopTokenResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{
+			"access_token": "test-dpop-access-token",
+			"token_type": "DPoP",
+			"expires_in": 3600
+		}`)),
+	}
+
+	// 业务响应（实际的 /v1/responses 响应）
+	businessResp := grokSearchChatBridgeCompletedResponse("resp_grok_search_chat")
+
+	upstream := &httpUpstreamRecorder{
+		responses: []*http.Response{dpopTokenResp, businessResp},
+	}
 	svc := &OpenAIGatewayService{
-		httpUpstream: upstream,
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
+		httpUpstream:   upstream,
 	}
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
@@ -168,6 +187,7 @@ func TestForwardGrokSearchChatCompletions_EnabledStreamingPropagatesChat(t *test
 	account := grokSearchChatBridgeTestAccount(83)
 	upstream := &httpUpstreamRecorder{resp: grokSearchChatBridgeCompletedResponse("resp_grok_search_chat_stream")}
 	svc := &OpenAIGatewayService{
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 		httpUpstream: upstream,
 	}
 
@@ -209,6 +229,7 @@ func TestForwardGrokSearchChatCompletions_MissingSSOTokenReturnsError(t *testing
 	}
 	upstream := &httpUpstreamRecorder{}
 	svc := &OpenAIGatewayService{
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 		httpUpstream: upstream,
 	}
 
@@ -235,6 +256,7 @@ func TestForwardGrokSearchChatCompletions_UsesChromeTLSProfile(t *testing.T) {
 		httpUpstreamRecorder: &httpUpstreamRecorder{resp: grokSearchChatBridgeCompletedResponse("resp_grok_search_tls")},
 	}
 	svc := &OpenAIGatewayService{
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 		httpUpstream: upstream,
 	}
 
