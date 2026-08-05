@@ -83,7 +83,7 @@ func TestForwardGrokSearchChatCompletions_DisabledRejects400(t *testing.T) {
 	upstream := &httpUpstreamRecorder{}
 	svc := &OpenAIGatewayService{
 		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
-		httpUpstream: upstream,
+		httpUpstream:   upstream,
 	}
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
@@ -118,27 +118,14 @@ func TestForwardGrokSearchChatCompletions_EnabledBridgesViaConsoleResponses(t *t
 
 	account := grokSearchChatBridgeTestAccount(82)
 
-	// DPoP token 交换响应（模拟 console.x.ai /v1/dpop/token 成功）
-	dpopTokenResp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body: io.NopCloser(strings.NewReader(`{
-			"access_token": "test-dpop-access-token",
-			"token_type": "DPoP",
-			"expires_in": 3600
-		}`)),
-	}
-
 	// 业务响应（实际的 /v1/responses 响应）
-	businessResp := grokSearchChatBridgeCompletedResponse("resp_grok_search_chat")
-
-	upstream := &httpUpstreamRecorder{
-		responses: []*http.Response{dpopTokenResp, businessResp},
-	}
+	upstream := &httpUpstreamRecorder{resp: grokSearchChatBridgeCompletedResponse("resp_grok_search_chat")}
 	svc := &OpenAIGatewayService{
 		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 		httpUpstream:   upstream,
 	}
+	// 预填充 DPoP session，跳过真实 token 交换（含 EC 密钥绑定校验，测试无法预知 cnf.jkt）
+	storeGrokSearchDPoPSessionForTest(t, svc.grokSearchDPoP, account, "sso-cookie-value")
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
 	require.NoError(t, err)
@@ -146,9 +133,11 @@ func TestForwardGrokSearchChatCompletions_EnabledBridgesViaConsoleResponses(t *t
 
 	// 上游 URL：console.x.ai/v1/responses
 	require.Equal(t, "https://console.x.ai/v1/responses", upstream.lastReq.URL.String())
-	// 认证：SSO cookie + anonymous（非 OAuth Bearer access_token）
+	// 认证：SSO cookie + DPoP scheme（非 OAuth Bearer access_token）
 	require.Equal(t, "sso=sso-cookie-value; sso-rw=sso-cookie-value", upstream.lastReq.Header.Get("Cookie"))
-	require.Equal(t, "Bearer anonymous", upstream.lastReq.Header.Get("Authorization"))
+	require.Equal(t, "DPoP mock-dpop-access-token", upstream.lastReq.Header.Get("Authorization"))
+	// DPoP proof 头存在
+	require.NotEmpty(t, upstream.lastReq.Header.Get("DPoP"))
 	// 上游 endpoint 标记为 console responses 路径
 	require.Equal(t, grokSearchResponsesPath, result.UpstreamEndpoint)
 	require.Equal(t, grokSearchResponsesPath, GetActualOpenAIUpstreamEndpoint(c))
@@ -188,8 +177,9 @@ func TestForwardGrokSearchChatCompletions_EnabledStreamingPropagatesChat(t *test
 	upstream := &httpUpstreamRecorder{resp: grokSearchChatBridgeCompletedResponse("resp_grok_search_chat_stream")}
 	svc := &OpenAIGatewayService{
 		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
-		httpUpstream: upstream,
+		httpUpstream:   upstream,
 	}
+	storeGrokSearchDPoPSessionForTest(t, svc.grokSearchDPoP, account, "sso-cookie-value")
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
 	require.NoError(t, err)
@@ -230,7 +220,7 @@ func TestForwardGrokSearchChatCompletions_MissingSSOTokenReturnsError(t *testing
 	upstream := &httpUpstreamRecorder{}
 	svc := &OpenAIGatewayService{
 		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
-		httpUpstream: upstream,
+		httpUpstream:   upstream,
 	}
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
@@ -257,8 +247,9 @@ func TestForwardGrokSearchChatCompletions_UsesChromeTLSProfile(t *testing.T) {
 	}
 	svc := &OpenAIGatewayService{
 		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
-		httpUpstream: upstream,
+		httpUpstream:   upstream,
 	}
+	storeGrokSearchDPoPSessionForTest(t, svc.grokSearchDPoP, account, "sso-cookie-value")
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
 	require.NoError(t, err)

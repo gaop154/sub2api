@@ -73,6 +73,7 @@ type AccountTestService struct {
 	httpUpstream              HTTPUpstream
 	cfg                       *config.Config
 	tlsFPProfileService       *TLSFingerprintProfileService
+	grokSearchDPoP            *grokSearchDPoPSessionManager
 	agentIdentityTaskMu       sync.Mutex
 	agentIdentityWS           agentIdentityWSConnectionInvalidator
 }
@@ -97,6 +98,7 @@ func NewAccountTestService(
 		httpUpstream:              httpUpstream,
 		cfg:                       cfg,
 		tlsFPProfileService:       tlsFPProfileService,
+		grokSearchDPoP:            newGrokSearchDPoPSessionManager(),
 	}
 }
 
@@ -837,7 +839,8 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 //   - 上游 URL：自拼 base_url + grokSearchResponsesPath（绕开 buildGrokResponsesURL 白名单）。
 //   - CF 策略：必须用 grokSearchChromeProfile() 的 Chrome uTLS 指纹过 console.x.ai 的 Cloudflare
 //     （裸 httpUpstream.Do 会被 CF 403），走 DoWithTLS。
-//   - 请求构造复用 buildGrokSearchRequest（已封装 Cookie/headers/Chrome UA）+ normalizeGrokSearchRequestBody。
+//   - 请求构造：normalizeGrokSearchRequestBody 归一 body + doGrokSearchDPoPRequest 注入 DPoP proof
+//     （console.x.ai 强制 DPoP，裸 SSO cookie 会 403 dpop-required）；与 forwardGrokSearch 同源。
 //
 // 测试场景只判连通性 + 给前端反馈，不改账号状态（不触发 markGrokSearchReauthRequired /
 // tempUnscheduleGrokSearch / accountRepo —— 那是转发链路的事，测试不应污染账号状态）。
@@ -893,19 +896,16 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
 
-	req, err := buildGrokSearchRequest(ctx, patchedBody, ssoToken, upstreamURL)
-	if err != nil {
-		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to create grok_search request: %s", err.Error()))
-	}
-
 	// 代理（与 forwardGrokSearch 一致）
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
 
-	// 必须用 Chrome uTLS 指纹过 CF（裸 Do 会被 CF 403），与 forwardGrokSearch 一致
-	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, grokSearchChromeProfile())
+	// 发送（DPoP proof + 401 自动重试，与 forwardGrokSearch 一致）。
+	// console.x.ai 强制 DPoP：必须走 doGrokSearchDPoPRequest（缺 DPoP proof 会 403 dpop-required）。
+	resp, err := doGrokSearchDPoPRequest(ctx, s.httpUpstream, s.grokSearchDPoP, account, ssoToken, proxyURL,
+		http.MethodPost, upstreamURL, patchedBody, "*/*")
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("grok_search test request failed: %s", err.Error()))
 	}
