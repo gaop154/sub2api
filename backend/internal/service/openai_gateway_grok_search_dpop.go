@@ -45,7 +45,7 @@ type grokSearchDPoPJWKStruct struct {
 type grokSearchDPoPSession struct {
 	accessToken string
 	privateKey  *ecdsa.PrivateKey
-	publicJWK grokSearchDPoPJWKStruct
+	publicJWK   grokSearchDPoPJWKStruct
 	expiresAt   time.Time
 }
 
@@ -90,12 +90,12 @@ func (e *grokSearchDPoPTokenError) response() *http.Response {
 		header.Set("X-Grok2API-Body-Truncated", "1")
 	}
 	return &http.Response{
-		StatusCode: e.status,
-		Status:     e.statusText,
-		Header:     header,
-		Body:       io.NopCloser(bytes.NewReader(e.body)),
+		StatusCode:    e.status,
+		Status:        e.statusText,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(e.body)),
 		ContentLength: int64(len(e.body)),
-		Request:    e.request,
+		Request:       e.request,
 	}
 }
 
@@ -107,10 +107,11 @@ func newGrokSearchDPoPSessionManager() *grokSearchDPoPSessionManager {
 	}
 }
 
-// get 获取或刷新 DPoP session（带 LRU 缓存与 singleflight 并发去重）
+// get 获取或刷新 DPoP session（带 LRU 缓存与 singleflight 并发去重）。
+// 不依赖具体 service，只接收 httpUpstream（gateway / test 两个 service 复用同一套 DPoP 逻辑）。
 func (m *grokSearchDPoPSessionManager) get(
 	ctx context.Context,
-	s *OpenAIGatewayService,
+	httpUpstream HTTPUpstream,
 	account *Account,
 	ssoToken string,
 ) (grokSearchDPoPSession, string, error) {
@@ -123,7 +124,7 @@ func (m *grokSearchDPoPSessionManager) get(
 		if session, ok := m.cached(key); ok {
 			return session, nil
 		}
-		session, fetchErr := s.fetchGrokSearchDPoPSession(ctx, account, ssoToken)
+		session, fetchErr := fetchGrokSearchDPoPSession(ctx, httpUpstream, account, ssoToken)
 		if fetchErr != nil {
 			return grokSearchDPoPSession{}, fetchErr
 		}
@@ -207,6 +208,7 @@ func grokSearchDPoPSessionCacheKey(baseURL string, account *Account, ssoToken st
 		strconv.FormatUint(uint64(account.ID), 10) + "|" +
 		hashToken(ssoToken)
 }
+
 // getBaseURL 获取账号的 base_url（优先从 credential，否则使用默认值）
 func getBaseURL(account *Account) string {
 	baseURL := strings.TrimSpace(account.GetCredential("base_url"))
@@ -216,9 +218,11 @@ func getBaseURL(account *Account) string {
 	return baseURL
 }
 
-// fetchGrokSearchDPoPSession 执行 DPoP token 交换与绑定校验
-func (s *OpenAIGatewayService) fetchGrokSearchDPoPSession(
+// fetchGrokSearchDPoPSession 执行 DPoP token 交换与绑定校验。
+// 包级函数，gateway / test 两个 service 复用（接收 httpUpstream，不绑定具体 service）。
+func fetchGrokSearchDPoPSession(
 	ctx context.Context,
+	httpUpstream HTTPUpstream,
 	account *Account,
 	ssoToken string,
 ) (grokSearchDPoPSession, error) {
@@ -250,7 +254,7 @@ func (s *OpenAIGatewayService) fetchGrokSearchDPoPSession(
 	req.Header.Set("Content-Type", "application/json")
 
 	// 用 DoWithTLS 发送（Chrome profile 过 CF）
-	resp, err := s.httpUpstream.DoWithTLS(req, "", account.ID, 0, grokSearchChromeProfile())
+	resp, err := httpUpstream.DoWithTLS(req, "", account.ID, 0, grokSearchChromeProfile())
 	if err != nil {
 		return grokSearchDPoPSession{}, err
 	}
@@ -325,9 +329,12 @@ func (s *OpenAIGatewayService) fetchGrokSearchDPoPSession(
 	}, nil
 }
 
-// doGrokSearchDPoPRequest 执行带 DPoP proof 的业务请求（401 自动重试一次）
-func (s *OpenAIGatewayService) doGrokSearchDPoPRequest(
+// doGrokSearchDPoPRequest 执行带 DPoP proof 的业务请求（401 自动重试一次）。
+// 包级函数，gateway / test 两个 service 复用（接收 httpUpstream + manager，不绑定具体 service）。
+func doGrokSearchDPoPRequest(
 	ctx context.Context,
+	httpUpstream HTTPUpstream,
+	manager *grokSearchDPoPSessionManager,
 	account *Account,
 	ssoToken string,
 	proxyURL string,
@@ -336,7 +343,7 @@ func (s *OpenAIGatewayService) doGrokSearchDPoPRequest(
 	accept string,
 ) (*http.Response, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		session, cacheKey, err := s.grokSearchDPoP.get(ctx, s, account, ssoToken)
+		session, cacheKey, err := manager.get(ctx, httpUpstream, account, ssoToken)
 		if err != nil {
 			var endpointErr *grokSearchDPoPTokenError
 			if errors.As(err, &endpointErr) {
@@ -366,7 +373,7 @@ func (s *OpenAIGatewayService) doGrokSearchDPoPRequest(
 			return nil, err
 		}
 
-		resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, 0, grokSearchChromeProfile())
+		resp, err := httpUpstream.DoWithTLS(req, proxyURL, account.ID, 0, grokSearchChromeProfile())
 		if err != nil {
 			return nil, err
 		}
@@ -377,7 +384,7 @@ func (s *OpenAIGatewayService) doGrokSearchDPoPRequest(
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		s.grokSearchDPoP.invalidate(cacheKey, session.accessToken)
+		manager.invalidate(cacheKey, session.accessToken)
 	}
 	return nil, errors.New("Console DPoP 重试状态无效")
 }

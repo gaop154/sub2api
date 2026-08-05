@@ -168,7 +168,7 @@ func TestGrokSearchDPoPHTUNormalization(t *testing.T) {
 		{
 			name:     "带 fragment",
 			inputURL: "https://console.x.ai/v1/responses#section",
-			expected: "https://console.x.ai/v1/responses", // 当前实现正确忽略 fragment（fragment 不在 path 中）
+			expected: "https://console.x.ai/v1/responses",
 		},
 		{
 			name:     "带 query 和 fragment",
@@ -184,7 +184,10 @@ func TestGrokSearchDPoPHTUNormalization(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", tt.inputURL, nil)
+			// 用 http.NewRequest（生产路径，url.Parse 正确分离 fragment），
+			// 而非 httptest.NewRequest（用 ParseRequestURI，不分离 fragment，会把 #section 编码进 path）。
+			req, err := http.NewRequest("POST", tt.inputURL, nil)
+			require.NoError(t, err)
 			htu := grokSearchDPoPHTU(req)
 			assert.Equal(t, tt.expected, htu, "HTU 应规范化正确")
 		})
@@ -338,4 +341,22 @@ func sum256(data []byte) []byte {
 func readAllAndClose(r io.ReadCloser) ([]byte, error) {
 	defer r.Close()
 	return io.ReadAll(r)
+}
+
+// storeGrokSearchDPoPSessionForTest 预填充 DPoP session 缓存，跳过真实 token 交换。
+// 让 forward / chat-bridge / test-connection 测试聚焦业务逻辑，不依赖 console.x.ai /v1/dpop/token
+// （真实 token 交换含 EC 密钥绑定校验，测试无法预知随机密钥的 cnf.jkt）。
+// 预填充后 doGrokSearchDPoPRequest.manager.get 直接命中缓存，只发一次业务请求。
+func storeGrokSearchDPoPSessionForTest(t *testing.T, manager *grokSearchDPoPSessionManager, account *Account, ssoToken string) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	session := grokSearchDPoPSession{
+		accessToken: "mock-dpop-access-token",
+		privateKey:  privateKey,
+		publicJWK:   grokSearchDPoPJWKFromKey(&privateKey.PublicKey),
+		expiresAt:   time.Now().UTC().Add(time.Hour),
+	}
+	key := grokSearchDPoPSessionCacheKey(getBaseURL(account), account, ssoToken)
+	manager.store(key, session)
 }

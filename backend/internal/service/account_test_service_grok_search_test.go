@@ -47,9 +47,12 @@ func TestAccountTestService_TestAccountConnection_GrokSearchUsesConsoleResponses
 		)),
 	}}
 	svc := &AccountTestService{
-		accountRepo:  repo,
-		httpUpstream: upstream,
+		accountRepo:    repo,
+		httpUpstream:   upstream,
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 	}
+	// 预填充 DPoP session，跳过真实 token 交换（含 EC 密钥绑定校验，测试无法预知 cnf.jkt）
+	storeGrokSearchDPoPSessionForTest(t, svc.grokSearchDPoP, account, "sso-cookie-value")
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -61,9 +64,10 @@ func TestAccountTestService_TestAccountConnection_GrokSearchUsesConsoleResponses
 	// 上游 URL：自拼 console.x.ai/v1/responses
 	require.Equal(t, "https://console.x.ai/v1/responses", upstream.lastReq.URL.String())
 
-	// 认证：SSO cookie，不是 Bearer access_token
+	// 认证：SSO cookie + DPoP scheme，不是 Bearer access_token
 	require.Equal(t, "sso=sso-cookie-value; sso-rw=sso-cookie-value", upstream.lastReq.Header.Get("Cookie"))
-	require.Equal(t, "Bearer anonymous", upstream.lastReq.Header.Get("Authorization"))
+	require.Equal(t, "DPoP mock-dpop-access-token", upstream.lastReq.Header.Get("Authorization"))
+	require.NotEmpty(t, upstream.lastReq.Header.Get("DPoP"))
 
 	// console 契约：store=false、tools 含 web_search/x_search、input 已 patch 为 input_text
 	require.False(t, gjson.GetBytes(upstream.lastBody, "store").Bool())
@@ -140,9 +144,12 @@ func TestAccountTestService_GrokSearchUpstreamError(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"sso expired"}}`)),
 	}}
 	svc := &AccountTestService{
-		accountRepo:  repo,
-		httpUpstream: upstream,
+		accountRepo:    repo,
+		httpUpstream:   upstream,
+		grokSearchDPoP: newGrokSearchDPoPSessionManager(),
 	}
+	// 预填充 DPoP session：业务请求 401 → 重试触发 token 交换（mock 同样 401）→ 最终返回 401
+	storeGrokSearchDPoPSessionForTest(t, svc.grokSearchDPoP, account, "sso-cookie-value")
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)

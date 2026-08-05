@@ -139,9 +139,8 @@ func (s *OpenAIGatewayService) forwardGrokSearch(
 	}
 
 	// 6. 发送（DPoP proof + 401 自动重试）
-	// 用 doGrokSearchDPoPRequest 替换 buildGrokSearchRequest + DoWithTLS，
-	// 内部处理 DPoP token 交换、proof 注入、401 重试一次。
-	resp, err := s.doGrokSearchDPoPRequest(upstreamCtx, account, ssoToken, proxyURL,
+	// doGrokSearchDPoPRequest 内部处理 DPoP token 交换、proof 注入、401 重试一次。
+	resp, err := doGrokSearchDPoPRequest(upstreamCtx, s.httpUpstream, s.grokSearchDPoP, account, ssoToken, proxyURL,
 		http.MethodPost, upstreamURL, patchedBody, "*/*")
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
@@ -197,42 +196,6 @@ func (s *OpenAIGatewayService) forwardGrokSearch(
 		Duration:        time.Since(startTime),
 		FirstTokenMs:    firstTokenMs,
 	}, nil
-}
-
-// buildGrokSearchRequest 构建 console.x.ai/v1/responses 请求。
-// 认证完全由 SSO cookie 控制（sso 与 sso-rw 同值），不依赖 OIDC access_token。
-// 不调 account.ApplyHeaderOverrides：cookie/authorization 在账号级覆写禁止列表内，
-// grok_search 的身份由 SSO 唯一决定，避免外部配置污染。
-func buildGrokSearchRequest(ctx context.Context, body []byte, ssoToken, upstreamURL string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create grok_search upstream request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	// SSO cookie：console 网页态认证（sso 与 sso-rw 同值）。PoC 暂不带 cf_clearance——
-	// cfprobe 实证 Chrome uTLS 指纹单独即可过 CF；完整版可再叠加 cf_clearance（参照 grok2api BuildSSOCookie）。
-	req.Header.Set("Cookie", "sso="+ssoToken+"; sso-rw="+ssoToken)
-	// console 网页态占位认证头（真实身份在 cookie）
-	req.Header.Set("Authorization", "Bearer anonymous")
-	// 网页态来源
-	req.Header.Set("Origin", grokSearchOrigin)
-	req.Header.Set("Referer", grokSearchOrigin+"/")
-	// 浏览器 fetch 语义头（参照 grok2api console/headers.go）
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Priority", "u=1, i")
-	// xAI 集群路由
-	req.Header.Set("x-cluster", grokSearchXCluster)
-	// Chrome 指纹：UA 与 Sec-Ch-Ua 大版本必须一致，否则 CF 指纹矛盾（design §4）
-	req.Header.Set("User-Agent", grokSearchUserAgent)
-	req.Header.Set("Sec-Ch-Ua", grokSearchSecChUa)
-	req.Header.Set("Sec-Ch-Ua-Mobile", grokSearchSecChUaMobile)
-	req.Header.Set("Sec-Ch-Ua-Platform", grokSearchSecChUaPlatform)
-	return req, nil
 }
 
 // grokSearchDefaultMaxOutputTokens 是 multi-agent 模型（grok-4.20-multi-agent-0309）的
@@ -647,11 +610,11 @@ func (s *OpenAIGatewayService) markGrokSearchReauthRequired(ctx context.Context,
 // 但关键差异（grok 与 grok_search 物理隔离）：
 //   - 凭证：自读 sso_token（account.GetCredential("sso_token")），不调 getRequestCredential/GetAccessToken
 //     （grok_search 身份由 SSO cookie 唯一决定，无 OIDC token）。
-//   - 端点+请求构造：复用 buildGrokSearchRequest（console.x.ai + SSO cookie + Chrome headers），
+//   - 端点+请求构造：doGrokSearchDPoPRequest（console.x.ai + SSO cookie + Chrome headers + DPoP proof），
 //     不用 buildGrokResponsesRequest（后者打 cli-chat-proxy.grok.com + OAuth Bearer）。
 //   - body：apicompat.ChatCompletionsToResponses 转 responses body → normalizeGrokSearchRequestBody
 //     （forwardGrokSearch 用的 console 契约归一化：store=false、tools 注入 web_search/x_search 等）。
-//   - 发送：DoWithTLS + grokSearchChromeProfile()（过 console.x.ai 的 Cloudflare），
+//   - 发送：doGrokSearchDPoPRequest（DoWithTLS + grokSearchChromeProfile() + DPoP，过 console.x.ai 的 Cloudflare），
 //     不用裸 Do（grok 桥走 cli-chat-proxy 不需要 Chrome 指纹）。
 //   - 错误处理：handleGrokSearchAccountUpstreamError（grok_search 独立策略，不含 402 冷却），
 //     不用 handleGrokAccountUpstreamError（后者会解析 grok OIDC 配额快照并触发 402 冷却）。
@@ -733,10 +696,9 @@ func (s *OpenAIGatewayService) forwardGrokSearchChatCompletionsViaResponses(
 	}
 
 	// 7. 发送（DPoP proof + 401 自动重试）
-	// 用 doGrokSearchDPoPRequest 替换 buildGrokSearchRequest + DoWithTLS，
-	// 内部处理 DPoP token 交换、proof 注入、401 重试一次。
+	// doGrokSearchDPoPRequest 内部处理 DPoP token 交换、proof 注入、401 重试一次。
 	SetActualOpenAIUpstreamEndpoint(c, grokSearchResponsesPath)
-	resp, err := s.doGrokSearchDPoPRequest(upstreamCtx, account, ssoToken, proxyURL,
+	resp, err := doGrokSearchDPoPRequest(upstreamCtx, s.httpUpstream, s.grokSearchDPoP, account, ssoToken, proxyURL,
 		http.MethodPost, upstreamURL, responsesBody, "*/*")
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
