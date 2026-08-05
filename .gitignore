@@ -146,3 +146,6 @@ docs/*
 frontend/coverage/
 aicodex
 output/
+# trellis：放开 spec/tasks/scripts 等团队文档；仅忽略运行时会话与个人工作区
+.trellis/.runtime/
+.trellis/workspace/

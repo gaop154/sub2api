@@ -24,6 +24,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
+	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -843,8 +844,8 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 //   - 请求构造：normalizeGrokSearchRequestBody 归一 body + doGrokSearchDPoPRequest 注入 DPoP proof
 //     （console.x.ai 强制 DPoP，裸 SSO cookie 会 403 dpop-required）；与 forwardGrokSearch 同源。
 //
-// 测试场景只判连通性 + 给前端反馈，不改账号状态（不触发 markGrokSearchReauthRequired /
-// tempUnscheduleGrokSearch / accountRepo —— 那是转发链路的事，测试不应污染账号状态）。
+// 错误状态码同样更新账号 DB 状态（applyGrokSearchTestAccountErrorState），语义对齐转发链路
+// handleGrokSearchAccountUpstreamError（仅 DB 持久化，无内存调度），与 grok/openai 等平台测试行为一致。
 func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, account *Account, modelID string) error {
 	ctx := c.Request.Context()
 
@@ -912,9 +913,10 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// 错误：只反馈给前端，不改账号状态（测试不调 markGrokSearchReauthRequired / tempUnscheduleGrokSearch）
+	// 错误：先按转发链路语义更新账号 DB 状态（与 grok/openai 平台测试一致），再反馈前端
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
+		s.applyGrokSearchTestAccountErrorState(ctx, account, resp.StatusCode, resp.Header, body)
 		return s.sendErrorAndEnd(c, fmt.Sprintf("grok_search test failed: status %d, %s",
 			resp.StatusCode, truncateString(string(body), 200)))
 	}
@@ -928,6 +930,72 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 	s.sendEvent(c, TestEvent{Type: "content", Text: text})
 	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 	return nil
+}
+
+// applyGrokSearchTestAccountErrorState 在测试连接返回错误状态码时更新账号 DB 状态，语义对齐
+// 转发链路 handleGrokSearchAccountUpstreamError（openai_gateway_grok_search.go），但只做 DB 持久化——
+// AccountTestService 无内存调度器，DB 状态会在下次 snapshot 同步到调度内存：
+//   - 401：SSO 失效 → SetError（status=error，需管理员重导 SSO，不自动恢复）。
+//   - 403：CF 挑战 → 不惩罚（出口/指纹问题）；permission-denied → SetError；dpop-required → 不惩罚（协议异常，SSO 仍有效）；其它 → 不处理。
+//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 24h；普通频率限制 → 短冷却 5min。
+//   - 5xx（非池模式）：短冷却 2min。
+//   - 其它：不处理。
+func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
+	if s == nil || account == nil || s.accountRepo == nil {
+		return
+	}
+	switch statusCode {
+	case http.StatusUnauthorized:
+		// SSO 无 refresh，失效只能重导：持久标记 error，不自动恢复。
+		s.setGrokSearchAccountError(ctx, account, "grok_search SSO token unauthorized; re-import SSO required")
+	case http.StatusForbidden:
+		// CF 挑战：console.x.ai 在 Cloudflare 后，403 常为出口/指纹问题，不惩罚账号。
+		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
+			return
+		}
+		// DPoP proof 缺失/无效（协议层异常，SSO 仍有效）：不惩罚账号。
+		if isGrokSearchDPoPRequired(responseBody) {
+			return
+		}
+		// SSO 权限丢失：同 401 处理，需管理员重导 SSO。
+		if isGrokSearchPermissionDenied(responseBody) {
+			s.setGrokSearchAccountError(ctx, account, "grok_search SSO permission denied; re-import SSO required")
+		}
+	case http.StatusTooManyRequests:
+		// CF 挑战可能伪装成 429，最优先排除，避免把出口问题误判为额度/频率问题。
+		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
+			return
+		}
+		if isGrokSearchFreeQuotaExhausted(responseBody) {
+			s.setGrokSearchAccountTempUnschedulable(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
+			return
+		}
+		s.setGrokSearchAccountTempUnschedulable(ctx, account, grokSearchRateLimitCooldown, "grok_search rate limited")
+	default:
+		if statusCode >= 500 && !account.IsPoolMode() {
+			s.setGrokSearchAccountTempUnschedulable(ctx, account, 2*time.Minute, "grok_search upstream temporary error")
+		}
+	}
+}
+
+// setGrokSearchAccountError 持久标记账号 error 状态（status=error + schedulable=false）。
+// 用 openAIAccountStateContext 对齐转发链路 markGrokSearchReauthRequired 的上下文语义。
+func (s *AccountTestService) setGrokSearchAccountError(ctx context.Context, account *Account, reason string) {
+	stateCtx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
+	_ = s.accountRepo.SetError(stateCtx, account.ID, reason)
+}
+
+// setGrokSearchAccountTempUnschedulable 临时下线账号（DB 持久化）。
+// 取已有 TempUnschedulableUntil 与 now+cooldown 的较大值，避免缩短更长冷却（对齐 tempUnscheduleGrokSearch）。
+func (s *AccountTestService) setGrokSearchAccountTempUnschedulable(ctx context.Context, account *Account, cooldown time.Duration, reason string) {
+	stateCtx, cancel := openAIAccountStateContext(ctx)
+	defer cancel()
+	until := time.Now().Add(cooldown)
+	if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(until) {
+		until = *account.TempUnschedulableUntil
+	}
+	_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
 }
 
 // extractGrokSearchResponseText 从 console.x.ai/v1/responses 非流式 JSON 响应中提取首段文本。

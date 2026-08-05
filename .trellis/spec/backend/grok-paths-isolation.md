@@ -87,7 +87,7 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 | 机制 | grok | grok_search |
 |---|---|---|
 | 到期自动放行 | ✅ `account.go:196` `now.Before(RateLimitResetAt)` 为 false 即回池 | ✅ `account.go:199` `now.Before(TempUnschedulableUntil)` 为 false 即回池 |
-| 探测成功提前清除 | ✅ `isSuccessfulGrokRateLimitRecovery`（`:1295`）+ `clearGrokRateLimitAfterRecovery`，带 generation 保护（`ClearRateLimitIfObserved`，`account_repo.go:2105`）| ✅ 管理员手动测试/探测 2xx（但测试函数本身不改状态，见 §5）|
+| 探测成功提前清除 | ✅ `isSuccessfulGrokRateLimitRecovery` + `clearGrokRateLimitAfterRecovery`，带 generation 保护（`ClearRateLimitIfObserved`）| ❌ 测试 2xx 不主动清除（测试仅在 HTTP ≥400 时写状态，见 §5）|
 | 凭据自愈 | ✅ OAuth 有 token refresh（`grok_token_refresher.go`），401 通常自愈 | ❌ SSO 无 refresh，401/403 权限失效 → `markGrokSearchReauthRequired`，需管理员重导 SSO |
 
 ### 4.4 状态码 → 动作总矩阵
@@ -104,25 +104,47 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 
 ---
 
-## 5. 测试连接契约（副作用差异）
+## 5. 测试连接契约（副作用）
 
-入口 `TestAccountConnection`（`account_test_service.go:180`）按 platform 分流到两个**独立**函数。两者共用测试框架（SSE 推进、`test_start` 事件、`httpUpstream`、默认模型 `grokDefaultResponsesModel`），但实现与副作用完全不同。
+入口 `TestAccountConnection`（`account_test_service.go`）按 platform 分流到两个**独立**函数。两者共用测试框架（SSE 推进、`test_start` 事件、`httpUpstream`、默认模型 `grokDefaultResponsesModel`），但实现与副作用不同。
 
-| 维度 | `testGrokAccountConnection`（`:715`）| `testGrokSearchAccountConnection`（`:844`）|
+| 维度 | `testGrokAccountConnection` | `testGrokSearchAccountConnection` |
 |---|---|---|
 | 认证 | `GetAccessTokenForManualTest` / API key | `sso_token` |
 | 上游 URL | `buildGrokResponsesURL`（走白名单）| 自拼 `base_url + /v1/responses`（绕白名单）|
 | TLS | 裸 `httpUpstream.Do`（cli-chat-proxy 无 CF）| `DoWithTLS` + `grokSearchChromeProfile()`（过 CF）|
 | 流式 | 流式 SSE（`processOpenAIStream`）| 非流式（`stream:false`，读 JSON 提取文本）|
-| **是否改账号状态** | **会**（见下）| **不会**（纯连通性，注释 `:842-843`）|
+| **是否改账号状态** | **会**（见下）| **会**（HTTP ≥400 → 账号 DB 状态，语义对齐转发链路）|
 
-**grok 测试的副作用清单**（`account_test_service.go:796-826`）：
+**grok 测试的副作用清单**：
 - 写 quota snapshot 到 extra
 - 命中限流 → `persistGrokRateLimit`（可能把账号压成限流）
 - 探测 2xx → `clearGrokRateLimitAfterRecovery`（提前解除限流）
 - 返回 **402 → `SetTempUnschedulable` 30min**
 
-> 注：grok 测试「不走调度资格门」（限流/冷却中的账号也能测，`:737`），但测试本身仍会更新配额/限流状态。**测 grok 账号可能把刚恢复的账号又压成限流，或 402 时临时下线 30min**；测 grok_search 账号是纯只读探测，不影响调度。
+**grok_search 测试的副作用**（`applyGrokSearchTestAccountErrorState`）：HTTP ≥400 时按转发链路 `handleGrokSearchAccountUpstreamError` 同语义更新账号 **DB** 状态（与 grok/openai 等平台测试连接一致）：
+
+| 状态码 | 动作 |
+|---|---|
+| 401 / 403 `permission-denied` | `SetError`（SSO 失效/权限丢失，持久 status=error，需重导 SSO）|
+| 403 CF 挑战 / `dpop-required` | **不惩罚**（出口/指纹/协议问题，SSO 仍有效）|
+| 429 免费额度耗尽（body 含 `free usage quota`）| `SetTempUnschedulable` 24h |
+| 429 普通频率限制 | `SetTempUnschedulable` 5min |
+| 5xx（非池模式）| `SetTempUnschedulable` 2min |
+
+> 注：两平台测试「不走调度资格门」（限流/冷却中的账号也能测），但测试本身会更新账号状态。**测 grok 账号可能把刚恢复的账号压成限流、或 402 时临时下线 30min；测 grok_search 账号在错误状态码时会 SetError/临时下线**——管理员测试即账号探测，副作用是预期的（与转发链路同语义）。测试 2xx 不主动清除任何状态。
+
+### 5.1 实现约定：测试连接错误处理内联（不复用 gateway）
+
+**Convention**：各平台 `testXxxAccountConnection` 的「错误状态码 → 账号状态变更」逻辑**内联在 `account_test_service.go`**，**不复用** gateway 转发链路的错误处理函数（`handleGrokAccountUpstreamError` / `handleGrokSearchAccountUpstreamError`）。
+
+**Why**：测试连接是管理员主动探测入口，与转发链路分离；强行抽共享决策函数（如 `planXxxErrorAction`）会让 gateway 与 test service 耦合，偏离项目既有模式（grok / openai / grok_search 测试连接均内联）。
+
+**How**：
+- 直接内联 `accountRepo.SetError` / `SetTempUnschedulable`（用 `openAIAccountStateContext(ctx)` 包裹上下文）。
+- **判定逻辑复用包级原子函数**（`isGrokSearchDPoPRequired`、`isGrokSearchPermissionDenied`、`isGrokSearchFreeQuotaExhausted`、`httputil.IsCloudflareChallengeResponse`）与冷却常量（`grokSearchFreeQuotaCooldown`、`grokSearchRateLimitCooldown`）——只组合调用，不复制实现。
+- **不要**为"DRY/解耦"重构 gateway 的 `handleXxxAccountUpstreamError` 来与 test service 共享决策；解耦靠复用包级原子，不靠抽共享决策函数。
+- AccountTestService 无内存调度器，测试连接只做 **DB 持久化**（`SetError`/`SetTempUnschedulable`），不做内存调度（`BlockAccountScheduling` 是 gateway 专属）；DB 状态会在下次 snapshot 同步到调度内存。
 
 ---
 
@@ -139,9 +161,10 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 #### Wrong
 - 「同账号绑 grok + grok_search，免费额度翻倍 / 互不影响」—— 额度是账号级共享。
 - 「grok 的 reset 逻辑（读头、2min~1h）也适用于 grok_search」—— 两套独立代码，grok_search 固定 24h。
-- 「测试 grok_search 账号会像 grok 一样改账号状态」—— grok_search 测试无副作用。
+- 「测试连接错误处理应抽共享决策函数（如 `planXxxErrorAction`）让 gateway 与 test service 复用」—— 违反内联约定，见 §5.1。
 
 #### Correct
+- 测试 grok_search 在 HTTP ≥400 时会按转发链路语义更新账号 DB 状态（401/403-permission→`SetError`，429/5xx→临时下线），与其他平台测试连接一致；错误处理内联在 `testGrokSearchAccountConnection`，不复用 gateway。
 - 要独立额度 → 换不同 xAI 账号。
 - grok_search 的 24h 冷却是**刻意贴近 Free 档真实恢复周期**的设计（grok 的 2min~1h 反而短于 Free 真实周期，Free 耗尽后会「恢复→打→挂→再限」循环）。
 - 排查 grok 类 402/429 反复：先确认账号档位；Free 档 grok 通道冷却短于真实恢复，循环属预期，真正恢复看 xAI 滚动 24h 窗口。
@@ -152,7 +175,7 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 
 1. **把「sub2api 通道隔离」当成「额度隔离」** → 通道隔离可证（§2），额度共享是 xAI 账号级行为（§3），sub2api 隔离不了。
 2. **grok 冷却（2min~1h）短于 Free 真实恢复（~24h）** → Free 档耗尽后 grok 通道会反复「恢复→打→402/429→再限」；grok_search 的 24h 更贴真实节奏，空转更少。
-3. **测 grok 账号有副作用** → 测试可能写 snapshot、触发 `persistGrokRateLimit`、或 402 时 `SetTempUnschedulable` 30min，干扰调度；grok_search 测试纯只读。
+3. **测账号有副作用** → 测 grok 可能写 snapshot、触发 `persistGrokRateLimit`、或 402 时临时下线 30min；测 grok_search 在 HTTP ≥400 时 `SetError`/临时下线（按转发链路同语义，见 §5）。两平台测试都不走调度资格门，冷却中的账号也能测。
 4. **grok_search 24h 不读上游头是刻意设计** → console 429 常不带 `Retry-After`，且 5min 短冷却会无效循环；不要为「对齐 grok 行为」改成读头/短冷却。
 5. **混淆"额度重置"两层** → xAI 额度恢复（一样，同时回血）≠ sub2api 调度冷却（两套不同代码）。用户问"多久重置"要先确认问的是哪层。
 6. **grok_search SSO 失效不会自愈** → 无 refresh，401/403 权限失效需管理员重导 SSO；grok OAuth 有 refresh 可自愈。
