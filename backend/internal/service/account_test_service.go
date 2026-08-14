@@ -1196,7 +1196,7 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 // AccountTestService 无内存调度器，DB 状态会在下次 snapshot 同步到调度内存：
 //   - 401：SSO 失效 → SetError（status=error，需管理员重导 SSO，不自动恢复）。
 //   - 403：CF 挑战 → 不惩罚（出口/指纹问题）；permission-denied → SetError；dpop-required → 不惩罚（协议异常，SSO 仍有效）；其它 → 不处理。
-//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 24h；普通频率限制 → 短冷却 5min。
+//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 30d；普通频率限制 → 短冷却 5min。
 //   - 5xx（非池模式）：短冷却 2min。
 //   - 其它：不处理。
 func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {

@@ -59,7 +59,7 @@ func cfChallengeHeaders() http.Header {
 // === 429 分支 ===
 
 // TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_LongCooldown 验证 REQ-1：
-// 429 body 含 "free usage quota"（实测 console 免费额度耗尽形态）→ 长冷却 24h，
+// 429 body 含 "free usage quota"（实测 console 免费额度耗尽形态）→ 长冷却 30d，
 // 而非原有的 5min 短退避（恢复后又 429 的无效循环）。
 func TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_LongCooldown(t *testing.T) {
 	svc := &OpenAIGatewayService{}
@@ -72,7 +72,7 @@ func TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_LongCooldown
 	until, ok := grokSearchLoadRuntimeBlockUntil(t, svc, account.ID)
 	require.True(t, ok)
 	require.WithinDuration(t, time.Now().Add(grokSearchFreeQuotaCooldown), until, 5*time.Second,
-		"冷却时长应为 24h（grokSearchFreeQuotaCooldown）")
+		"冷却时长应为 30d（grokSearchFreeQuotaCooldown）")
 }
 
 // TestHandleGrokSearchAccountUpstreamError_429NormalRateLimit_ShortCooldown 验证：
@@ -90,7 +90,7 @@ func TestHandleGrokSearchAccountUpstreamError_429NormalRateLimit_ShortCooldown(t
 	until, ok := grokSearchLoadRuntimeBlockUntil(t, svc, account.ID)
 	require.True(t, ok)
 	require.WithinDuration(t, time.Now().Add(grokSearchRateLimitCooldown), until, 5*time.Second,
-		"冷却时长应为 5min（grokSearchRateLimitCooldown），不因 resource-exhausted code 被误判为 24h")
+		"冷却时长应为 5min（grokSearchRateLimitCooldown），不因 resource-exhausted code 被误判为长冷却")
 }
 
 // TestHandleGrokSearchAccountUpstreamError_429Cloudflare_NotBlocked 验证 REQ-2/决策树：

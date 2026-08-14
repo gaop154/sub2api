@@ -480,8 +480,8 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
 			return
 		}
-		// 免费额度耗尽（非瞬时频率限制）：长冷却 24h，避免 5min 恢复后又 429 的无效循环。
-		// console 网页订阅免费额度按周期重置，对齐 grok2api defaultFreeQuotaRecoveryPause。
+		// 免费额度耗尽（非瞬时频率限制）：长冷却 30d，避免短冷却恢复后又 429 的无效循环。
+		// console 网页订阅免费额度按月重置，24h 冷却不够，改为一个月。
 		if isGrokSearchFreeQuotaExhausted(responseBody) {
 			s.tempUnscheduleGrokSearch(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
 			return
@@ -498,10 +498,10 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 // grok_search 错误处理冷却时长。
 const (
 	// grokSearchFreeQuotaCooldown：console 网页订阅"免费额度耗尽"冷却时长。
-	// 该错误本质是免费配额按周期耗尽（非瞬时频率限制），短冷却（5min）无效——
-	// 恢复调度后又 429，形成无效循环。固定 24h 对齐 grok2api defaultFreeQuotaRecoveryPause，
+	// 该错误本质是免费配额按月耗尽（非瞬时频率限制），短冷却（5min）甚至 24h 均无效——
+	// 恢复调度后又 429，形成无效循环。实测额度按月重置，固定 30d，
 	// 确定可预期（console 该错误可能不带 Retry-After，本期不增加配置项）。
-	grokSearchFreeQuotaCooldown = 24 * time.Hour
+	grokSearchFreeQuotaCooldown = 30 * 24 * time.Hour
 	// grokSearchRateLimitCooldown：普通瞬时频率限制（RPS 等）的短退避，保持原有 5min 行为。
 	grokSearchRateLimitCooldown = 5 * time.Minute
 )
@@ -511,7 +511,7 @@ const (
 //
 // 注意：不单看 code:resource-exhausted——grok2api 经验显示 console 的 RPS 速率限流也是这个 code
 // （其 error 文本为 "Too many requests for team... Requests per Second"）。单看 code 会把 RPS 限流
-// 误判成额度耗尽、走 24h 长冷却（实际只需 5min）。这里用 error 文本 "free usage quota" 精确区分，
+// 误判成额度耗尽、走 30d 长冷却（实际只需 5min）。这里用 error 文本 "free usage quota" 精确区分，
 // 大小写不敏感。
 func isGrokSearchFreeQuotaExhausted(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "free usage quota")
