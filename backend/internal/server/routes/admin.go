@@ -61,6 +61,9 @@ func RegisterAdminRoutes(
 		// Grok Search（SSO Console 通道，与 Grok OAuth 物理隔离）
 		registerGrokSearchRoutes(admin, h)
 
+		// 国产供应商（kimi/zhipu/deepseek）额度与余额
+		registerCNProviderRoutes(admin, h)
+
 		// 代理管理
 		registerProxyRoutes(admin, h, stepUpAuth)
 
@@ -492,6 +495,17 @@ func registerGrokSearchRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	{
 		// 批量导入 SSO token，创建 grok_search 账号（不走 OAuth 兑换）。
 		grokSearch.POST("/sso", h.Admin.GrokSearch.CreateAccountsFromSSO)
+	}
+}
+
+// registerCNProviderRoutes 注册国产供应商（kimi/zhipu/deepseek）的额度与余额查询端点。
+func registerCNProviderRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	cn := admin.Group("/cn-providers")
+	{
+		// Coding Plan 滚动窗口用量（kimi/zhipu coding 账号）。
+		cn.GET("/accounts/:id/quota", h.Admin.CNProvider.QueryQuota)
+		// payg 账号余额（kimi/deepseek；zhipu 无余额端点）。
+		cn.GET("/accounts/:id/balance", h.Admin.CNProvider.QueryBalance)
 	}
 }
 
