@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -199,21 +201,32 @@ func (s *OpenAIGatewayService) forwardGrokSearch(
 }
 
 // grokSearchDefaultMaxOutputTokens 是 multi-agent 模型（grok-4.20-multi-agent-0309）的
-// console 默认 max_output_tokens（参照 grok2api catalog.go ModelSpec.MaxOutputTokens）。
-const grokSearchDefaultMaxOutputTokens = 2_000_000
+// console 默认 max_output_tokens（取自上游 grok2api catalog multi-agent 实际值 1_000_000）。
+// 注意勿放大：上游按模型上限校验，超出会被上游拒绝（历史抄录曾误写 2_000_000，已回正）。
+const grokSearchDefaultMaxOutputTokens = 1_000_000
 
 // normalizeGrokSearchRequestBody 施加 console.x.ai/v1/responses 的请求体契约。
-// 逻辑参照 grok2api（C:\idealProject\github\grok2api）console/normalize.go，精简为 grok_search 的
-// multi-agent 搜索路径所需：
+// 逻辑参照 grok2api（C:\idealProject\github\grok2api）console/normalize.go（62d2775c），
+// 精简为 grok_search 的 multi-agent 搜索路径所需：
 //   - model = upstreamModel；store=false（console 无状态）。
 //   - 删 metadata/previous_response_id/service_tier/prompt_cache_key/background/conversation。
-//   - patchInput：text/output_text → input_text；image_url → input_image（展平 url）。
-//   - max_output_tokens 缺省补 multi-agent 默认。
-//   - reasoning.effort 归一（minimal/max 等 → console 档位），缺省 medium；preferredEffort
-//     为模型名 effort 后缀剥离值（见 splitGrokSearchEffortSuffix），客户端未显式带 effort 时生效。
+//   - patchInput：text/output_text → input_text；image_url → input_image（展平 url）；
+//     reasoning item 的无 type 文本 part 补 type:"reasoning_text"（多轮回放防御）。
+//   - max_output_tokens 缺省补 multi-agent 默认（grokSearchDefaultMaxOutputTokens）。
+//   - reasoning.effort 归一（minimal/max 等 → console 档位；auto 为上游合法档原样透传），
+//     缺省 medium；preferredEffort 为模型名 effort 后缀剥离值（见 splitGrokSearchEffortSuffix），
+//     客户端未显式带 effort 时生效。
 //   - include 补 reasoning.encrypted_content（multi-agent 链路需要）。
-//   - tools 归一 + 注入 web_search/x_search（multi-agent 搜索能力）。
-//   - tool_choice 缺省 auto。
+//   - tools 归一 + 注入 web_search/x_search（multi-agent 搜索能力）；透传 web_search 的
+//     enable_image_search、x_search 的 from_date/to_date（严格 YYYY-MM-DD）；保留原生 xAI 工具类型
+//     （mcp/shell/image_generation/collections_search/file_search/code_execution/code_interpreter）；
+//     客户端带 view_image function 工具时强制关闭 web_search 的 enable_image_understanding
+//     （xAI 服务端开启 image understanding 会附带同名 view_image 工具，撞名整单被拒）。
+//   - tool_choice 收紧（normalizeGrokSearchToolChoice）：required/function 指定仅在保留了
+//     客户端工具时放行，其余降级 auto。
+//
+// 注意：默认注入 web_search/x_search 是本平台刻意设计（grok_search 定位即搜索通道），
+// 与上游 grok2api 339617a2 之后的行为相反，勿"对齐"移除（任务 PRD Non-goals 已拍板保留）。
 func normalizeGrokSearchRequestBody(body []byte, upstreamModel string, preferredEffort string) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
@@ -233,10 +246,8 @@ func normalizeGrokSearchRequestBody(body []byte, upstreamModel string, preferred
 	}
 	normalizeGrokSearchReasoning(payload, preferredEffort)
 	ensureGrokSearchReasoningInclude(payload)
-	normalizeGrokSearchTools(payload)
-	if _, exists := payload["tool_choice"]; !exists {
-		payload["tool_choice"] = "auto"
-	}
+	retainedClientTools := normalizeGrokSearchTools(payload)
+	normalizeGrokSearchToolChoice(payload, retainedClientTools)
 	return json.Marshal(payload)
 }
 
@@ -249,6 +260,13 @@ func patchGrokSearchInput(payload map[string]any) {
 	for _, rawItem := range items {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
+			continue
+		}
+		// reasoning item：多轮回放时客户端回传的 reasoning part 可能缺 type，
+		// 上游为此专门要求补 type:"reasoning_text"，补完 continue（不走下面 content 的通用 patch，
+		// reasoning content 不做 text→input_text 改写）。对齐上游 patchConsoleInput:126-129。
+		if item["type"] == "reasoning" {
+			patchGrokSearchReasoningContent(item)
 			continue
 		}
 		content, ok := item["content"].([]any)
@@ -270,6 +288,27 @@ func patchGrokSearchInput(payload map[string]any) {
 						part["image_url"] = url
 					}
 				}
+			}
+		}
+	}
+}
+
+// patchGrokSearchReasoningContent 补全 reasoning item 的 content part 类型：
+// 无 type 但有 text 的 part 补 type:"reasoning_text"（对齐上游 patchConsoleReasoningContent）。
+// 仅补缺失的 type，已有 type 或无 text 的 part 不动。
+func patchGrokSearchReasoningContent(item map[string]any) {
+	content, ok := item["content"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawPart := range content {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := part["type"]; !exists {
+			if _, hasText := part["text"]; hasText {
+				part["type"] = "reasoning_text"
 			}
 		}
 	}
@@ -307,6 +346,13 @@ func normalizeGrokSearchEffort(v string) string {
 		return "high"
 	case "xhigh", "max":
 		return "xhigh"
+	case "auto":
+		// auto 档原样透传，不落 medium 兜底。与上游 console 62d2775c 的 multi-agent 行为一致：
+		// 其 normalizeEffort 不识别 auto（归一为空），而 multi-agent 的 DefaultReasoningEffort
+		// 也为空，原 "auto" 留在 reasoning map 里透传；"auto 落 medium" 只发生在带默认档的
+		// 模型（grok-4.3/4.5），不适用于本通道。注意：模型名 effort 后缀表
+		// （splitGrokSearchEffortSuffix）不含 "-auto"，后缀剥离不触发。
+		return "auto"
 	default:
 		return ""
 	}
@@ -377,12 +423,23 @@ func ensureGrokSearchReasoningInclude(payload map[string]any) {
 	payload["include"] = result
 }
 
-// normalizeGrokSearchTools 归一 tools：web_search/x_search 补全子字段、function 保留白名单字段；
-// 若缺 web_search/x_search 则注入（multi-agent 搜索能力，参照 grok2api mergeSearchTools）。
-func normalizeGrokSearchTools(payload map[string]any) {
+// normalizeGrokSearchTools 归一 tools：web_search/x_search 补全子字段、function 保留白名单字段、
+// 原生 xAI 工具类型原样透传；若缺 web_search/x_search 则注入（multi-agent 搜索能力）。
+// 返回 retainedClientTools：是否保留了客户端工具（function 或原生类型），供
+// normalizeGrokSearchToolChoice 判定 required/forced function 是否放行。
+// 行为对齐上游 normalizeConsoleTools（62d2775c），差异仅"缺则注入搜索工具"（本平台刻意设计）。
+func normalizeGrokSearchTools(payload map[string]any) bool {
 	result := make([]any, 0, 4)
 	hasWebSearch, hasXSearch := false, false
+	retainedClientTools := false
+	// xAI 服务端在 web_search 开启 image understanding 时会附带同名 view_image 工具；
+	// 客户端已自带 view_image function 时撞名会被 mgw 以 duplicate tool definition 整单拒绝，
+	// 此时强制关闭 enable_image_understanding（客户端显式 true 也忽略），优先让客户端工具生效。
+	// 注入兜底分支同样受此约束（客户端带 view_image 而未带 web_search 时，注入的 web_search
+	// 也必须关闭 image understanding，否则同样撞名）。
+	hasClientViewImage := false
 	if tools, ok := payload["tools"].([]any); ok {
+		hasClientViewImage = hasGrokSearchFunctionTool(tools, "view_image")
 		for _, raw := range tools {
 			tool, ok := raw.(map[string]any)
 			if !ok {
@@ -391,9 +448,13 @@ func normalizeGrokSearchTools(payload map[string]any) {
 			typeName, _ := tool["type"].(string)
 			switch strings.ToLower(strings.TrimSpace(typeName)) {
 			case "web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search_2025_08_26":
-				clean := map[string]any{"type": "web_search", "enable_image_understanding": true}
-				if v, ok := tool["enable_image_understanding"].(bool); ok {
+				clean := map[string]any{"type": "web_search", "enable_image_understanding": !hasClientViewImage}
+				if v, ok := tool["enable_image_understanding"].(bool); ok && !hasClientViewImage {
 					clean["enable_image_understanding"] = v
+				}
+				// 透传图片搜索开关：客户端显式传布尔才写键，缺省不产生该键。
+				if v, ok := tool["enable_image_search"].(bool); ok {
+					clean["enable_image_search"] = v
 				}
 				result = append(result, clean)
 				hasWebSearch = true
@@ -401,6 +462,28 @@ func normalizeGrokSearchTools(payload map[string]any) {
 				clean := map[string]any{"type": "x_search", "enable_video_understanding": true}
 				if v, ok := tool["enable_video_understanding"].(bool); ok {
 					clean["enable_video_understanding"] = v
+				}
+				// 透传 X 搜索时间范围（from_date/to_date，严格 YYYY-MM-DD）：
+				// 非字符串/空串/非法格式丢弃（parse 后回写比对全等才收）；两者齐备且 from > to
+				// 时成对丢弃，避免上游 400。
+				for _, field := range []string{"from_date", "to_date"} {
+					text, ok := tool[field].(string)
+					if !ok || text == "" {
+						continue
+					}
+					if date, err := time.Parse("2006-01-02", text); err == nil && date.Format("2006-01-02") == text {
+						clean[field] = text
+					}
+				}
+				if from, ok := clean["from_date"].(string); ok {
+					if to, ok2 := clean["to_date"].(string); ok2 {
+						fromDate, _ := time.Parse("2006-01-02", from)
+						toDate, _ := time.Parse("2006-01-02", to)
+						if fromDate.After(toDate) {
+							delete(clean, "from_date")
+							delete(clean, "to_date")
+						}
+					}
 				}
 				result = append(result, clean)
 				hasXSearch = true
@@ -416,16 +499,100 @@ func normalizeGrokSearchTools(payload map[string]any) {
 					}
 				}
 				result = append(result, clean)
+				retainedClientTools = true
+			case "mcp", "shell", "image_generation", "collections_search", "file_search", "code_execution", "code_interpreter":
+				// 原生 xAI Responses 工具类型：原样保留整个对象（不构造不裁剪），
+				// 最坏与上游 console 网页行为一致；namespace/tool_search 等客户端侧抽象不透传
+				//（透传反而触发上游 400）。这些类型同样计为客户端工具，参与 tool_choice 放行判定。
+				result = append(result, tool)
+				retainedClientTools = true
 			}
 		}
 	}
 	if !hasWebSearch {
-		result = append(result, map[string]any{"type": "web_search", "enable_image_understanding": true})
+		result = append(result, map[string]any{"type": "web_search", "enable_image_understanding": !hasClientViewImage})
 	}
 	if !hasXSearch {
 		result = append(result, map[string]any{"type": "x_search", "enable_video_understanding": true})
 	}
 	payload["tools"] = result
+	return retainedClientTools
+}
+
+// hasGrokSearchFunctionTool 检查客户端 tools 中是否携带指定名称的 function 类型工具
+//（type=function 且 name 大小写不敏感匹配，对齐上游 hasConsoleFunctionTool）。
+// 用于 view_image 撞名兜底判定。
+func hasGrokSearchFunctionTool(tools []any, target string) bool {
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName, _ := tool["type"].(string)
+		name, _ := tool["name"].(string)
+		if strings.EqualFold(strings.TrimSpace(typeName), "function") && strings.EqualFold(strings.TrimSpace(name), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeGrokSearchToolChoice 收紧 tool_choice（对齐上游 normalizeConsoleToolChoice:355-399）：
+//   - tools 不存在 → 删除 tool_choice（本实现恒注入搜索工具，此分支仅防御性对齐上游）。
+//   - tool_choice 缺省 → auto。
+//   - 字符串 none/auto → 保留（归一小写）；required → 仅在保留了客户端工具（retainedClientTools，
+//     即 function 或原生 xAI 工具类型）时放行，否则降级 auto；其它未知取值 → auto。
+//   - 对象 {type:"function", name}（name 为空时回落读嵌套 function.name）→ 同 required 的放行条件，
+//     且归一为 {type,name} 标准形态；条件不满足或 name 仍为空 → auto。
+//   - 非 string 非 map → auto。
+//
+// 背景：required/forced function 在没有任何客户端工具时上游必拒（无工具可强制调用），
+// 收紧为 auto 让请求可用而非报错。
+func normalizeGrokSearchToolChoice(payload map[string]any, retainedClientTools bool) {
+	if _, exists := payload["tools"]; !exists {
+		delete(payload, "tool_choice")
+		return
+	}
+	choice, exists := payload["tool_choice"]
+	if !exists {
+		payload["tool_choice"] = "auto"
+		return
+	}
+	if value, ok := choice.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "none", "auto":
+			payload["tool_choice"] = strings.ToLower(strings.TrimSpace(value))
+		case "required":
+			if !retainedClientTools {
+				payload["tool_choice"] = "auto"
+			}
+		default:
+			payload["tool_choice"] = "auto"
+		}
+		return
+	}
+	object, ok := choice.(map[string]any)
+	if !ok {
+		payload["tool_choice"] = "auto"
+		return
+	}
+	typeName, _ := object["type"].(string)
+	if typeName != "function" || !retainedClientTools {
+		payload["tool_choice"] = "auto"
+		return
+	}
+	name, _ := object["name"].(string)
+	if strings.TrimSpace(name) == "" {
+		// 兼容嵌套形态：{"type":"function","function":{"name":...}}
+		if function, ok := object["function"].(map[string]any); ok {
+			name, _ = function["name"].(string)
+		}
+	}
+	if strings.TrimSpace(name) == "" {
+		payload["tool_choice"] = "auto"
+		return
+	}
+	payload["tool_choice"] = map[string]any{"type": "function", "name": strings.TrimSpace(name)}
 }
 
 // getStringFromMap 安全读取 map 中的字符串字段。
@@ -441,7 +608,9 @@ func getStringFromMap(m map[string]any, key string) string {
 // 策略（design §2 状态码决策树）：
 //   - 401：SSO 失效，持久标记需重认证（无 refresh，管理员重导 SSO）。
 //   - 403：CF 挑战 → 不惩罚账号（出口/指纹问题）；SSO 权限失效 → 同 401 重认证；其它 → 不特殊处理。
-//   - 429：CF 挑战 → 不惩罚账号；免费额度耗尽 → 长冷却 24h；普通瞬时频率限制 → 短退避 5min。
+//   - 429：CF 挑战 → 不惩罚账号；免费额度耗尽 → 长冷却 30d（grokSearchFreeQuotaCooldown）；
+//     普通瞬时频率限制 → 按上游精确信号冷却（Retry-After 头 > body "Resets in: 3m 4s" 时长，
+//     clamp [1min, 24h]），无信号维持 5min 兜底。
 //   - 5xx：非池模式下短冷却。
 //   - 其余：不冷却，仅由调用方透传错误。
 //
@@ -486,8 +655,20 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 			s.tempUnscheduleGrokSearch(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
 			return
 		}
-		// 普通瞬时频率限制：短退避（保持原有行为）
-		s.tempUnscheduleGrokSearch(ctx, account, grokSearchRateLimitCooldown, "grok_search rate limited")
+		// 普通瞬时频率限制：按上游精确信号冷却（对齐上游 normalizeRateLimitResponse 的精确调度）——
+		// Retry-After 头优先、body "Resets in: 3m 4s" 次之，clamp 到 [1min, 24h]；无信号维持 5min 兜底。
+		cooldown := grokSearchRetryAfterFromHeader(headers.Get("Retry-After"), time.Now())
+		if cooldown <= 0 {
+			cooldown = grokSearchRetryAfterFromBody(responseBody)
+		}
+		if cooldown <= 0 {
+			cooldown = grokSearchRateLimitCooldown
+		} else if cooldown < grokSearchRetryAfterMinCooldown {
+			cooldown = grokSearchRetryAfterMinCooldown
+		} else if cooldown > grokSearchRetryAfterMaxCooldown {
+			cooldown = grokSearchRetryAfterMaxCooldown
+		}
+		s.tempUnscheduleGrokSearch(ctx, account, cooldown, "grok_search rate limited")
 	default:
 		if statusCode >= 500 && !account.IsPoolMode() {
 			s.tempUnscheduleGrokSearch(ctx, account, 2*time.Minute, "grok_search upstream temporary error")
@@ -502,9 +683,60 @@ const (
 	// 恢复调度后又 429，形成无效循环。实测额度按月重置，固定 30d，
 	// 确定可预期（console 该错误可能不带 Retry-After，本期不增加配置项）。
 	grokSearchFreeQuotaCooldown = 30 * 24 * time.Hour
-	// grokSearchRateLimitCooldown：普通瞬时频率限制（RPS 等）的短退避，保持原有 5min 行为。
+	// grokSearchRateLimitCooldown：普通瞬时频率限制（RPS 等）的兜底短退避，
+	// 仅当 429 响应无 Retry-After 头且 body 无 "Resets in" 信号时使用（保持原有 5min 行为）。
 	grokSearchRateLimitCooldown = 5 * time.Minute
+	// grokSearchRetryAfterMinCooldown / grokSearchRetryAfterMaxCooldown：429 瞬时频率限制
+	// 按上游精确信号（Retry-After 头 / body "Resets in"）冷却的 clamp 边界——
+	// 解析值过短无意义（下限 1min），过长不可信（天级信号视为异常，封顶 24h）。
+	grokSearchRetryAfterMinCooldown = time.Minute
+	grokSearchRetryAfterMaxCooldown = 24 * time.Hour
 )
+
+// grokSearchResetDurationPattern 匹配 "Resets in: 3m 4s" 形态中的时长片段（数字 + d/h/m/s 单位），
+// 移植上游 resetDurationPattern。
+var grokSearchResetDurationPattern = regexp.MustCompile(`(?i)(\d+)\s*([dhms])`)
+
+// grokSearchRetryAfterFromHeader 解析 429 响应 Retry-After 头的剩余等待时长：
+// 支持整数秒（"90"）与 HTTP 日期（RFC 1123/850/ANSI 三格式，now 起算的差值）。
+// 无效值、非正时长或过去的时间点返回 0。移植上游 parseConsoleRetryAfterHeader。
+func grokSearchRetryAfterFromHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+// grokSearchRetryAfterFromBody 从 429 响应 body 中解析 "Resets in: 3m 4s" 形态的重置时长：
+// 定位首个 "resets in:"（大小写不敏感）后，累加其后所有 (\d+)(d/h/m/s) 片段；无匹配返回 0。
+// 移植上游 consoleRetryAfter。
+func grokSearchRetryAfterFromBody(body []byte) time.Duration {
+	text := string(body)
+	index := strings.Index(strings.ToLower(text), "resets in:")
+	if index < 0 {
+		return 0
+	}
+	text = text[index+len("resets in:"):]
+	var total time.Duration
+	for _, match := range grokSearchResetDurationPattern.FindAllStringSubmatch(text, -1) {
+		value, _ := strconv.Atoi(match[1])
+		switch strings.ToLower(match[2]) {
+		case "d":
+			total += time.Duration(value) * 24 * time.Hour
+		case "h":
+			total += time.Duration(value) * time.Hour
+		case "m":
+			total += time.Duration(value) * time.Minute
+		case "s":
+			total += time.Duration(value) * time.Second
+		}
+	}
+	return total
+}
 
 // isGrokSearchFreeQuotaExhausted 识别 console 免费额度耗尽的 429 响应。
 // 实测 body 形如：{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits..."}。

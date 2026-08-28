@@ -578,7 +578,7 @@ func (s *AccountTestService) fetchUpstreamModelList(ctx context.Context, account
 	// 同步上游模型直接返回静态 xAI 模型列表（与 grok 平台一致），不打上游——
 	// 避免对不存在的端点发请求而 404/403。模型集与 defaultModelsListCandidateIDs 一致。
 	if account.Platform == PlatformGrokSearch {
-		return xai.DefaultModelIDs(), nil
+		return xai.DefaultModelIDs(), nil, nil
 	}
 
 	if account.Platform == PlatformAntigravity && account.Type != AccountTypeAPIKey {
