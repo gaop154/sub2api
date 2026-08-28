@@ -1243,7 +1243,8 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 // AccountTestService 无内存调度器，DB 状态会在下次 snapshot 同步到调度内存：
 //   - 401：SSO 失效 → SetError（status=error，需管理员重导 SSO，不自动恢复）。
 //   - 403：CF 挑战 → 不惩罚（出口/指纹问题）；permission-denied → SetError；dpop-required → 不惩罚（协议异常，SSO 仍有效）；其它 → 不处理。
-//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 30d；普通频率限制 → 短冷却 5min。
+//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 30d；普通频率限制 → 按上游精确信号冷却
+//     （Retry-After 头 > body "Resets in" 时长，clamp [1min, 24h]），无信号 5min 兜底。
 //   - 5xx（非池模式）：短冷却 2min。
 //   - 其它：不处理。
 func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
@@ -1276,7 +1277,21 @@ func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Co
 			s.setGrokSearchAccountTempUnschedulable(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
 			return
 		}
-		s.setGrokSearchAccountTempUnschedulable(ctx, account, grokSearchRateLimitCooldown, "grok_search rate limited")
+		// 普通瞬时频率限制：与转发链路 handleGrokSearchAccountUpstreamError 同语义——复用同一对
+		// 纯解析函数内联组合（spec §5.1：复用包级原子、内联组合，不抽共享决策函数）：
+		// Retry-After 头优先、body "Resets in" 次之，clamp [1min, 24h]，无信号 5min 兜底。
+		cooldown := grokSearchRetryAfterFromHeader(headers.Get("Retry-After"), time.Now())
+		if cooldown <= 0 {
+			cooldown = grokSearchRetryAfterFromBody(responseBody)
+		}
+		if cooldown <= 0 {
+			cooldown = grokSearchRateLimitCooldown
+		} else if cooldown < grokSearchRetryAfterMinCooldown {
+			cooldown = grokSearchRetryAfterMinCooldown
+		} else if cooldown > grokSearchRetryAfterMaxCooldown {
+			cooldown = grokSearchRetryAfterMaxCooldown
+		}
+		s.setGrokSearchAccountTempUnschedulable(ctx, account, cooldown, "grok_search rate limited")
 	default:
 		if statusCode >= 500 && !account.IsPoolMode() {
 			s.setGrokSearchAccountTempUnschedulable(ctx, account, 2*time.Minute, "grok_search upstream temporary error")

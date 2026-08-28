@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/grok-paths-isolation.md", "reason": "检查改动是否守住平台隔离边界：不得让 grok_search 复用 grok 的错误处理/冷却路径；§5.1 内联约定不得被破坏"}
+{"file": ".trellis/spec/backend/upstream-egress.md", "reason": "检查 DPoP/请求头改动未破坏 CF 过指纹链路（Chrome profile、浏览器头集合不变）"}
