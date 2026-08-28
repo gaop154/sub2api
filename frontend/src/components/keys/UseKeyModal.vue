@@ -1225,6 +1225,7 @@ function generateRoutedCodexFiles(
     gemini: 'Gemini',
     antigravity: 'Antigravity',
     grok: 'Grok',
+    grok_search: 'Grok Search',
     kimi: 'Kimi',
     zhipu: 'Zhipu',
     deepseek: 'DeepSeek',
