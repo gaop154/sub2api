@@ -205,13 +205,13 @@ func TestGrokSearchDPoPSessionCache(t *testing.T) {
 
 	// 测试缓存 key 构造稳定性
 	baseURL := "https://console.x.ai"
-	key1 := grokSearchDPoPSessionCacheKey(baseURL, account, "test-sso-token")
-	key2 := grokSearchDPoPSessionCacheKey(baseURL, account, "test-sso-token")
+	key1 := grokSearchDPoPSessionCacheKey(baseURL, account, "test-sso-token", "")
+	key2 := grokSearchDPoPSessionCacheKey(baseURL, account, "test-sso-token", "")
 	assert.Equal(t, key1, key2, "相同参数应生成相同 cache key")
 
 	// 不同账号应有不同 key
 	account2 := &Account{ID: 1002}
-	key3 := grokSearchDPoPSessionCacheKey(baseURL, account2, "test-sso-token")
+	key3 := grokSearchDPoPSessionCacheKey(baseURL, account2, "test-sso-token", "")
 	assert.NotEqual(t, key1, key3, "不同账号应有不同 cache key")
 }
 
@@ -347,6 +347,7 @@ func readAllAndClose(r io.ReadCloser) ([]byte, error) {
 // 让 forward / chat-bridge / test-connection 测试聚焦业务逻辑，不依赖 console.x.ai /v1/dpop/token
 // （真实 token 交换含 EC 密钥绑定校验，测试无法预知随机密钥的 cnf.jkt）。
 // 预填充后 doGrokSearchDPoPRequest.manager.get 直接命中缓存，只发一次业务请求。
+// 既有调用方账号均未配代理（proxyURL 为空串），缓存键以空串出口预填充即可命中。
 func storeGrokSearchDPoPSessionForTest(t *testing.T, manager *grokSearchDPoPSessionManager, account *Account, ssoToken string) {
 	t.Helper()
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -357,6 +358,6 @@ func storeGrokSearchDPoPSessionForTest(t *testing.T, manager *grokSearchDPoPSess
 		publicJWK:   grokSearchDPoPJWKFromKey(&privateKey.PublicKey),
 		expiresAt:   time.Now().UTC().Add(time.Hour),
 	}
-	key := grokSearchDPoPSessionCacheKey(getBaseURL(account), account, ssoToken)
+	key := grokSearchDPoPSessionCacheKey(getBaseURL(account), account, ssoToken, "")
 	manager.store(key, session)
 }

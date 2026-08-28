@@ -47,6 +47,10 @@ type grokSearchDPoPSession struct {
 	privateKey  *ecdsa.PrivateKey
 	publicJWK   grokSearchDPoPJWKStruct
 	expiresAt   time.Time
+	// clockSkew 是从 mint 响应 Date 头学习到的时钟偏差（服务器时间 − 本地时间）。
+	// 0 是合法值，表示"不修正"。每个 session 都携带显式定义的 skew，
+	// 保证 proof 的 iat 永不依赖未初始化的字段。
+	clockSkew time.Duration
 }
 
 // grokSearchDPoPSessionManager 管理 DPoP session 的 LRU 缓存与并发去重
@@ -109,13 +113,15 @@ func newGrokSearchDPoPSessionManager() *grokSearchDPoPSessionManager {
 
 // get 获取或刷新 DPoP session（带 LRU 缓存与 singleflight 并发去重）。
 // 不依赖具体 service，只接收 httpUpstream（gateway / test 两个 service 复用同一套 DPoP 逻辑）。
+// proxyURL 参与缓存键（出口标识）：换代理即换 session，mint 也走同一出口。
 func (m *grokSearchDPoPSessionManager) get(
 	ctx context.Context,
 	httpUpstream HTTPUpstream,
 	account *Account,
 	ssoToken string,
+	proxyURL string,
 ) (grokSearchDPoPSession, string, error) {
-	key := grokSearchDPoPSessionCacheKey(getBaseURL(account), account, ssoToken)
+	key := grokSearchDPoPSessionCacheKey(getBaseURL(account), account, ssoToken, proxyURL)
 	if session, ok := m.cached(key); ok {
 		return session, key, nil
 	}
@@ -124,7 +130,7 @@ func (m *grokSearchDPoPSessionManager) get(
 		if session, ok := m.cached(key); ok {
 			return session, nil
 		}
-		session, fetchErr := fetchGrokSearchDPoPSession(ctx, httpUpstream, account, ssoToken)
+		session, fetchErr := fetchGrokSearchDPoPSession(ctx, httpUpstream, account, ssoToken, proxyURL)
 		if fetchErr != nil {
 			return grokSearchDPoPSession{}, fetchErr
 		}
@@ -202,10 +208,13 @@ func (m *grokSearchDPoPSessionManager) removeLocked(entry *grokSearchDPoPSession
 	}
 }
 
-// grokSearchDPoPSessionCacheKey 构造缓存键：base_url|account.ID|sha256(sso)
-func grokSearchDPoPSessionCacheKey(baseURL string, account *Account, ssoToken string) string {
+// grokSearchDPoPSessionCacheKey 构造缓存键：base_url|account.ID|proxyURL|sha256(sso)。
+// proxyURL 是出口标识（空串=直连，也参与键构成）：mint 必须与业务请求同一出口，
+// 换代理即换 session，避免换出口后复用旧出口 mint 的 token 触发上游风控。
+func grokSearchDPoPSessionCacheKey(baseURL string, account *Account, ssoToken string, proxyURL string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "|" +
 		strconv.FormatUint(uint64(account.ID), 10) + "|" +
+		proxyURL + "|" +
 		hashToken(ssoToken)
 }
 
@@ -220,11 +229,13 @@ func getBaseURL(account *Account) string {
 
 // fetchGrokSearchDPoPSession 执行 DPoP token 交换与绑定校验。
 // 包级函数，gateway / test 两个 service 复用（接收 httpUpstream，不绑定具体 service）。
+// proxyURL 必须与业务请求一致：mint 与业务同出口，避免同一 SSO 双出口 IP 触发上游风控。
 func fetchGrokSearchDPoPSession(
 	ctx context.Context,
 	httpUpstream HTTPUpstream,
 	account *Account,
 	ssoToken string,
+	proxyURL string,
 ) (grokSearchDPoPSession, error) {
 	// 1. 生成 EC P-256 密钥对
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -253,8 +264,11 @@ func fetchGrokSearchDPoPSession(
 	applyGrokSearchBrowserHeaders(req, ssoToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	// 用 DoWithTLS 发送（Chrome profile 过 CF）
-	resp, err := httpUpstream.DoWithTLS(req, "", account.ID, 0, grokSearchChromeProfile())
+	// 记录请求发出前的本地时间，与响应读完后的 localAfter 一起界定 RTT 窗口（用于学习时钟偏差）
+	localBefore := time.Now().UTC()
+
+	// 用 DoWithTLS 发送（Chrome profile 过 CF）；出口必须与业务请求一致（proxyURL）
+	resp, err := httpUpstream.DoWithTLS(req, proxyURL, account.ID, 0, grokSearchChromeProfile())
 	if err != nil {
 		return grokSearchDPoPSession{}, err
 	}
@@ -264,6 +278,10 @@ func fetchGrokSearchDPoPSession(
 	if err != nil {
 		return grokSearchDPoPSession{}, err
 	}
+	localAfter := time.Now().UTC()
+
+	// 从 Date 头学习时钟偏差：缺失/不可解析返回 0，session 始终携带可用的定义值
+	clockSkew := grokSearchDPoPClockSkewFromDateHeader(resp.Header.Get("Date"), localBefore, localAfter)
 
 	// 3. 解析响应
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -307,7 +325,8 @@ func fetchGrokSearchDPoPSession(
 		return grokSearchDPoPSession{}, errors.New("Console DPoP token 与本地密钥不匹配")
 	}
 
-	// 5. 计算过期时间（取 expires_in 与 token exp 的较小值）
+	// 5. 计算过期时间（取 expires_in 与 token exp 的较小值）。
+	// 过期簿记保持本地墙钟（缓存判定自洽），clockSkew 只作用于 proof 的 iat
 	now := time.Now().UTC()
 	expiresAt := now.Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
 	if tokenExpiry.Before(expiresAt) {
@@ -326,11 +345,13 @@ func fetchGrokSearchDPoPSession(
 		privateKey:  privateKey,
 		publicJWK:   publicJWK,
 		expiresAt:   expiresAt,
+		clockSkew:   clockSkew,
 	}, nil
 }
 
 // doGrokSearchDPoPRequest 执行带 DPoP proof 的业务请求（401 自动重试一次）。
 // 包级函数，gateway / test 两个 service 复用（接收 httpUpstream + manager，不绑定具体 service）。
+// proxyURL 同时下传给 mint（session 获取）与业务请求：两条路径同一出口。
 func doGrokSearchDPoPRequest(
 	ctx context.Context,
 	httpUpstream HTTPUpstream,
@@ -343,7 +364,7 @@ func doGrokSearchDPoPRequest(
 	accept string,
 ) (*http.Response, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		session, cacheKey, err := manager.get(ctx, httpUpstream, account, ssoToken)
+		session, cacheKey, err := manager.get(ctx, httpUpstream, account, ssoToken, proxyURL)
 		if err != nil {
 			var endpointErr *grokSearchDPoPTokenError
 			if errors.As(err, &endpointErr) {
@@ -449,7 +470,7 @@ func applyGrokSearchDPoPAuthorization(req *http.Request, session grokSearchDPoPS
 		"jti": uuid.NewString(),
 		"htm": strings.ToUpper(req.Method),
 		"htu": grokSearchDPoPHTU(req),
-		"iat": time.Now().UTC().Unix(),
+		"iat": grokSearchDPoPProofIAT(session, time.Now().UTC()),
 		"ath": base64.RawURLEncoding.EncodeToString(digest[:]),
 	}
 	proof := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
@@ -462,6 +483,43 @@ func applyGrokSearchDPoPAuthorization(req *http.Request, session grokSearchDPoPS
 	req.Header.Set("Authorization", "DPoP "+session.accessToken)
 	req.Header.Set("DPoP", signed)
 	return nil
+}
+
+// grokSearchDPoPProofIAT 返回 DPoP proof 使用的 iat（Unix 秒）。
+// session.clockSkew 在 mint 时始终有定义值（Date 缺失时为 0）；
+// localNow 零值兜底为当前时间，保证 proof 永不依赖未初始化输入。
+func grokSearchDPoPProofIAT(session grokSearchDPoPSession, localNow time.Time) int64 {
+	if localNow.IsZero() {
+		localNow = time.Now().UTC()
+	}
+	return localNow.Add(session.clockSkew).UTC().Unix()
+}
+
+// grokSearchDPoPClockSkewFromDateHeader 从 mint 响应 Date 头学习时钟偏差（对齐 console.x.ai 前端行为）：
+// skewSeconds ≈ round((serverDate − localNow) / 1s)，后续以 iat = floor((localNow + skew) / 1s) 应用。
+// localBefore/localAfter 界定 mint 响应的 RTT 窗口，取中点近似"Date 头到达时刻的本地时间"，
+// 免去额外调用时间 API。Date 缺失或不可解析返回 0，调用方始终拿到可用的 skew 值。
+func grokSearchDPoPClockSkewFromDateHeader(dateHeader string, localBefore, localAfter time.Time) time.Duration {
+	dateHeader = strings.TrimSpace(dateHeader)
+	if dateHeader == "" {
+		return 0
+	}
+	serverTime, err := http.ParseTime(dateHeader)
+	if err != nil {
+		return 0
+	}
+	// 本地观察窗口异常（localAfter 零值或早于 localBefore）先收敛，保证中点计算有意义
+	if localAfter.IsZero() || localAfter.Before(localBefore) {
+		localAfter = localBefore
+	}
+	if localBefore.IsZero() {
+		localBefore = time.Now().UTC()
+		localAfter = localBefore
+	}
+	// RTT 窗口中点近似 Date 头设置时刻的本地时间
+	localMid := localBefore.Add(localAfter.Sub(localBefore) / 2)
+	// DPoP iat 精度为秒，取整秒存储；Round 的 half-away-from-zero 对正负偏差两个方向都成立
+	return serverTime.UTC().Sub(localMid.UTC()).Round(time.Second)
 }
 
 // grokSearchDPoPHTU 规范化 HTTP-TU（scheme://host/path，host 小写，去 query/fragment）
