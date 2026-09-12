@@ -121,6 +121,9 @@ tests
 !deploy/tests/**
 CLAUDE.md
 .claude
+.pi
+AGENTS.md
+.agents
 scripts
 !backend/scripts/
 !backend/scripts/resolve-version.sh
