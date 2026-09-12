@@ -608,7 +608,8 @@ func getStringFromMap(m map[string]any, key string) string {
 // 策略（design §2 状态码决策树）：
 //   - 401：SSO 失效，持久标记需重认证（无 refresh，管理员重导 SSO）。
 //   - 403：CF 挑战 → 不惩罚账号（出口/指纹问题）；SSO 权限失效 → 同 401 重认证；其它 → 不特殊处理。
-//   - 429：CF 挑战 → 不惩罚账号；免费额度耗尽 → 长冷却 30d（grokSearchFreeQuotaCooldown）；
+//   - 429：CF 挑战 → 不惩罚账号；免费额度耗尽 → 持久标记 error（markGrokSearchQuotaExhausted，
+//     status=error + schedulable=false，不自动回池，管理员充值/换号/确认额度恢复后手动恢复账号）；
 //     普通瞬时频率限制 → 按上游精确信号冷却（Retry-After 头 > body "Resets in: 3m 4s" 时长，
 //     clamp [1min, 24h]），无信号维持 5min 兜底。
 //   - 5xx：非池模式下短冷却。
@@ -649,10 +650,11 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
 			return
 		}
-		// 免费额度耗尽（非瞬时频率限制）：长冷却 30d，避免短冷却恢复后又 429 的无效循环。
-		// console 网页订阅免费额度按月重置，24h 冷却不够，改为一个月。
+		// 免费额度耗尽（非瞬时频率限制）：持久标记 error 不自动回池（R13，2026-09-12 实测修订）。
+		// 原 30d 冷却依据「额度按月重置」假设，现实测 >2 个月额度仍未恢复、重置周期不可预期，
+		// 到期回池只是周期性制造 429 探测；管理员充值/换号/确认额度恢复后手动恢复账号。
 		if isGrokSearchFreeQuotaExhausted(responseBody) {
-			s.tempUnscheduleGrokSearch(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
+			s.markGrokSearchQuotaExhausted(ctx, account)
 			return
 		}
 		// 普通瞬时频率限制：按上游精确信号冷却（对齐上游 normalizeRateLimitResponse 的精确调度）——
@@ -678,11 +680,6 @@ func (s *OpenAIGatewayService) handleGrokSearchAccountUpstreamError(ctx context.
 
 // grok_search 错误处理冷却时长。
 const (
-	// grokSearchFreeQuotaCooldown：console 网页订阅"免费额度耗尽"冷却时长。
-	// 该错误本质是免费配额按月耗尽（非瞬时频率限制），短冷却（5min）甚至 24h 均无效——
-	// 恢复调度后又 429，形成无效循环。实测额度按月重置，固定 30d，
-	// 确定可预期（console 该错误可能不带 Retry-After，本期不增加配置项）。
-	grokSearchFreeQuotaCooldown = 30 * 24 * time.Hour
 	// grokSearchRateLimitCooldown：普通瞬时频率限制（RPS 等）的兜底短退避，
 	// 仅当 429 响应无 Retry-After 头且 body 无 "Resets in" 信号时使用（保持原有 5min 行为）。
 	grokSearchRateLimitCooldown = 5 * time.Minute
@@ -743,7 +740,7 @@ func grokSearchRetryAfterFromBody(body []byte) time.Duration {
 //
 // 注意：不单看 code:resource-exhausted——grok2api 经验显示 console 的 RPS 速率限流也是这个 code
 // （其 error 文本为 "Too many requests for team... Requests per Second"）。单看 code 会把 RPS 限流
-// 误判成额度耗尽、走 30d 长冷却（实际只需 5min）。这里用 error 文本 "free usage quota" 精确区分，
+// 误判成额度耗尽、走持久标记（实际只需短冷却）。这里用 error 文本 "free usage quota" 精确区分，
 // 大小写不敏感。
 func isGrokSearchFreeQuotaExhausted(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "free usage quota")
@@ -831,6 +828,27 @@ func (s *OpenAIGatewayService) markGrokSearchReauthRequired(ctx context.Context,
 		if err := s.accountRepo.SetError(stateCtx, account.ID, reason); err != nil {
 			logger.LegacyPrintf("service.openai_gateway_grok_search",
 				"mark grok_search reauth failed account_id=%d err=%v", account.ID, err)
+		}
+	}
+}
+
+// markGrokSearchQuotaExhausted 持久标记 grok_search 账号"免费额度耗尽"：
+// DB SetError（status=error + error_message + schedulable=false，不自动回池）+ 内存调度即时下线。
+// 与 markGrokSearchReauthRequired 同机制但 reason 区分——免费额度重置周期实测不可预期（>2 月未恢复），
+// 到期自动回池只是周期性制造 429 探测；管理员充值/换号/确认额度恢复后手动恢复账号。
+func (s *OpenAIGatewayService) markGrokSearchQuotaExhausted(ctx context.Context, account *Account) {
+	if s == nil || account == nil {
+		return
+	}
+	const reason = "grok_search free usage quota exhausted; purchase credits or replace account"
+	// 内存调度即时下线（24h 兜底，等 DB snapshot 同步；额度耗尽不会自愈）
+	s.BlockAccountScheduling(account, time.Now().Add(24*time.Hour), reason)
+	if s.accountRepo != nil {
+		stateCtx, cancel := openAIAccountStateContext(ctx)
+		defer cancel()
+		if err := s.accountRepo.SetError(stateCtx, account.ID, reason); err != nil {
+			logger.LegacyPrintf("service.openai_gateway_grok_search",
+				"mark grok_search quota exhausted failed account_id=%d err=%v", account.ID, err)
 		}
 	}
 }

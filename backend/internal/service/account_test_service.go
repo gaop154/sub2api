@@ -1352,8 +1352,8 @@ func (s *AccountTestService) testGrokSearchAccountConnection(c *gin.Context, acc
 // AccountTestService 无内存调度器，DB 状态会在下次 snapshot 同步到调度内存：
 //   - 401：SSO 失效 → SetError（status=error，需管理员重导 SSO，不自动恢复）。
 //   - 403：CF 挑战 → 不惩罚（出口/指纹问题）；permission-denied → SetError；dpop-required → 不惩罚（协议异常，SSO 仍有效）；其它 → 不处理。
-//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → 长冷却 30d；普通频率限制 → 按上游精确信号冷却
-//     （Retry-After 头 > body "Resets in" 时长，clamp [1min, 24h]），无信号 5min 兜底。
+//   - 429：CF 挑战 → 不惩罚；免费额度耗尽 → SetError 持久标记（不自动回池，管理员充值/换号后手动恢复）；
+//     普通频率限制 → 按上游精确信号冷却（Retry-After 头 > body "Resets in" 时长，clamp [1min, 24h]），无信号 5min 兜底。
 //   - 5xx（非池模式）：短冷却 2min。
 //   - 其它：不处理。
 func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte) {
@@ -1382,8 +1382,11 @@ func (s *AccountTestService) applyGrokSearchTestAccountErrorState(ctx context.Co
 		if httputil.IsCloudflareChallengeResponse(statusCode, headers, responseBody) {
 			return
 		}
+		// 免费额度耗尽：持久标记 error 不自动回池（与转发链路 markGrokSearchQuotaExhausted 同语义；
+		// spec §5.1 内联约定——直接 SetError，不调 gateway 方法）。重置周期实测不可预期，
+		// 管理员充值/换号/确认额度恢复后手动恢复账号。
 		if isGrokSearchFreeQuotaExhausted(responseBody) {
-			s.setGrokSearchAccountTempUnschedulable(ctx, account, grokSearchFreeQuotaCooldown, "grok_search free usage quota exhausted")
+			s.setGrokSearchAccountError(ctx, account, "grok_search free usage quota exhausted; purchase credits or replace account")
 			return
 		}
 		// 普通瞬时频率限制：与转发链路 handleGrokSearchAccountUpstreamError 同语义——复用同一对

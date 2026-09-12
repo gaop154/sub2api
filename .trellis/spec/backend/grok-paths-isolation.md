@@ -74,19 +74,18 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 
 - 落 `RateLimitResetAt`，单调递增（`SetRateLimitedIfLater`）。
 
-### 4.2 grok_search（429：免费额度固定时长；瞬时限流读上游信号精确冷却）
+### 4.2 grok_search（429：免费额度持久标记；瞬时限流读上游信号精确冷却）
 
 - 入口 `handleGrokSearchAccountUpstreamError`。
-- 免费额度耗尽（`isGrokSearchFreeQuotaExhausted`：body 含 `free usage quota`）→ `tempUnscheduleGrokSearch(grokSearchFreeQuotaCooldown = 30d)`。
+- 免费额度耗尽（`isGrokSearchFreeQuotaExhausted`：body 含 `free usage quota`）→ `markGrokSearchQuotaExhausted`（DB `SetError`：status=error + schedulable=false，**不自动回池**；内存 `BlockAccountScheduling` 24h 兜底等 snapshot 同步）。恢复只能靠管理员（充值/换号/确认额度恢复后手动恢复账号）。**历史**：曾为 30d 临时冷却（依据「额度按月重置」假设），2026-09-12 实测 >2 月额度未恢复、重置周期不可预期，改为持久标记（R13）。
 - 瞬时 RPS/RPM 限流 → **精确冷却**：①`Retry-After` 头（整数秒或 HTTP 日期，过去时间视为无信号）优先；②body `"Resets in: 3m 4s"`（`(\d+)\s*([dhms])` 累加）次之——纯函数 `grokSearchRetryAfterFromHeader` / `grokSearchRetryAfterFromBody`（移植上游 parseConsoleRetryAfterHeader/consoleRetryAfter）；有值 clamp 到 `[1min, 24h]`，两者皆无 → `grokSearchRateLimitCooldown = 5min` 兜底。
-- **固定 30d 是刻意的**：console 的 429 常不带 `Retry-After`，且 5min 恢复后又 429 形成无效循环；实测免费额度按**月**重置，24h 冷却不够（恢复后仍 429），2026-08 起由 24h 调整为 30d。
-- 落 `TempUnschedulableUntil`。
+- 瞬时限流落 `TempUnschedulableUntil`（到期自动放行）；免费额度耗尽落 status=error（无到期语义）。
 
 ### 4.3 恢复机制（两边都有）
 
 | 机制 | grok | grok_search |
 |---|---|---|
-| 到期自动放行 | ✅ `account.go:196` `now.Before(RateLimitResetAt)` 为 false 即回池 | ✅ `account.go:199` `now.Before(TempUnschedulableUntil)` 为 false 即回池 |
+| 到期自动放行 | ✅ `account.go:196` `now.Before(RateLimitResetAt)` 为 false 即回池 | ⚠️ 仅瞬时限流：`account.go:199` `now.Before(TempUnschedulableUntil)` 为 false 即回池；**免费额度耗尽与 SSO 失效不走此路径**（持久 error，需管理员手动恢复）|
 | 探测成功提前清除 | ✅ `isSuccessfulGrokRateLimitRecovery` + `clearGrokRateLimitAfterRecovery`，带 generation 保护（`ClearRateLimitIfObserved`）| ❌ 测试 2xx 不主动清除（测试仅在 HTTP ≥400 时写状态，见 §5）|
 | 凭据自愈 | ✅ OAuth 有 token refresh（`grok_token_refresher.go`），401 通常自愈 | ❌ SSO 无 refresh，401/403 权限失效 → `markGrokSearchReauthRequired`，需管理员重导 SSO |
 
@@ -97,7 +96,7 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 | 401 | temp 10min（凭据未授权，通常 refresh 自愈）| `markGrokSearchReauthRequired`（持久 status=error，24h 兜底 block，需重导 SSO）|
 | 402 | temp 30min（payment required）| 不冷却（grok_search 目标正是绕开 402；console 返回 402 按未知透传）|
 | 403 | 30min 或 `applyGrokForbiddenPolicy`（entitlement）| CF 挑战→不惩罚 / SSO 权限失效→markReauthRequired / 其它→不处理 |
-| 429 | `RateLimitResetAt`（读头 / 兜底 2min / 阶梯 10min~1h）| CF→不惩罚 / 免费额度→30d / RPS→精确冷却（头 > body `"Resets in"`，clamp [1min,24h]，兜底 5min）|
+| 429 | `RateLimitResetAt`（读头 / 兜底 2min / 阶梯 10min~1h）| CF→不惩罚 / 免费额度→`markGrokSearchQuotaExhausted` 持久 error / RPS→精确冷却（头 > body `"Resets in"`，clamp [1min,24h]，兜底 5min）|
 | 5xx | temp 2min（非 pool mode）| temp 2min（非 pool mode）|
 
 > grok_search 的 **CF 判定必须在最前**（403/429 都可能命中 `IsCloudflareChallengeResponse`），CF 是出口/指纹问题，绝不冷却或失效账号。
@@ -135,7 +134,7 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 |---|---|
 | 401 / 403 `permission-denied` | `SetError`（SSO 失效/权限丢失，持久 status=error，需重导 SSO）|
 | 403 CF 挑战 / `dpop-required` | **不惩罚**（出口/指纹/协议问题，SSO 仍有效）|
-| 429 免费额度耗尽（body 含 `free usage quota`）| `SetTempUnschedulable` 30d |
+| 429 免费额度耗尽（body 含 `free usage quota`）| `SetError`（持久 status=error，不自动回池；管理员充值/换号后手动恢复）|
 | 429 普通频率限制 | `SetTempUnschedulable` 精确冷却（同转发链路语义：头优先→body→clamp [1min,24h]→5min 兜底；复用 `grokSearchRetryAfterFromHeader/FromBody` 包级原子）|
 | 5xx（非池模式）| `SetTempUnschedulable` 2min |
 
@@ -149,7 +148,7 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 
 **How**：
 - 直接内联 `accountRepo.SetError` / `SetTempUnschedulable`（用 `openAIAccountStateContext(ctx)` 包裹上下文）。
-- **判定逻辑复用包级原子函数**（`isGrokSearchDPoPRequired`、`isGrokSearchPermissionDenied`、`isGrokSearchFreeQuotaExhausted`、`grokSearchRetryAfterFromHeader`、`grokSearchRetryAfterFromBody`、`httputil.IsCloudflareChallengeResponse`）与冷却常量（`grokSearchFreeQuotaCooldown`、`grokSearchRateLimitCooldown`）——只组合调用，不复制实现。
+- **判定逻辑复用包级原子函数**（`isGrokSearchDPoPRequired`、`isGrokSearchPermissionDenied`、`isGrokSearchFreeQuotaExhausted`、`grokSearchRetryAfterFromHeader`、`grokSearchRetryAfterFromBody`、`httputil.IsCloudflareChallengeResponse`）与冷却常量（`grokSearchRateLimitCooldown`）——只组合调用，不复制实现。
 - **不要**为"DRY/解耦"重构 gateway 的 `handleXxxAccountUpstreamError` 来与 test service 共享决策；解耦靠复用包级原子，不靠抽共享决策函数。
 - AccountTestService 无内存调度器，测试连接只做 **DB 持久化**（`SetError`/`SetTempUnschedulable`），不做内存调度（`BlockAccountScheduling` 是 gateway 专属）；DB 状态会在下次 snapshot 同步到调度内存。
 
@@ -167,14 +166,14 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 
 #### Wrong
 - 「同账号绑 grok + grok_search，免费额度翻倍 / 互不影响」—— 额度是账号级共享。
-- 「grok 的 reset 逻辑（读头、2min~1h）也适用于 grok_search」—— 两套独立代码，grok_search 免费额度固定 30d；瞬时限流走独立的精确冷却（§4.2）。
+- 「grok 的 reset 逻辑（读头、2min~1h）也适用于 grok_search」—— 两套独立代码，grok_search 免费额度走持久标记（SetError 不回池）；瞬时限流走独立的精确冷却（§4.2）。
 - 「测试连接错误处理应抽共享决策函数（如 `planXxxErrorAction`）让 gateway 与 test service 复用」—— 违反内联约定，见 §5.1。
 - 「DPoP token 全局复用一份、代理只管业务请求」—— mint 与业务请求必须同出口；缓存键含 proxyURL，换代理即重新 mint（§4.5）。
 
 #### Correct
-- 测试 grok_search 在 HTTP ≥400 时会按转发链路语义更新账号 DB 状态（401/403-permission→`SetError`，429/5xx→临时下线），与其他平台测试连接一致；错误处理内联在 `testGrokSearchAccountConnection`，不复用 gateway。
+- 测试 grok_search 在 HTTP ≥400 时会按转发链路语义更新账号 DB 状态（401/403-permission/429 免费额度→`SetError`，429 瞬时限流/5xx→临时下线），与其他平台测试连接一致；错误处理内联在 `testGrokSearchAccountConnection`，不复用 gateway。
 - 要独立额度 → 换不同 xAI 账号。
-- grok_search 的 30d 冷却是**刻意贴近免费额度按月重置的真实周期**的设计（grok 的 2min~1h 反而短于真实周期，Free 耗尽后会「恢复→打→挂→再限」循环）。
+- grok_search 免费额度耗尽后是**持久标记不回池**（实测重置周期不可预期，>2 月未恢复；管理员充值/换号后手动恢复）；grok 通道冷却（2min~1h）短于 Free 真实恢复，Free 耗尽后会「恢复→打→挂→再限」循环，属预期。
 - 排查 grok 类 402/429 反复：先确认账号档位；Free 档 grok 通道冷却短于真实恢复，循环属预期，真正恢复看 xAI 滚动 24h 窗口。
 
 ---
@@ -182,9 +181,9 @@ sub2api 把 grok 和 grok_search 当**两条独立链路**处理。关键事实�
 ## 8. Common Mistakes / Gotchas
 
 1. **把「sub2api 通道隔离」当成「额度隔离」** → 通道隔离可证（§2），额度共享是 xAI 账号级行为（§3），sub2api 隔离不了。
-2. **grok 冷却（2min~1h）短于 Free 真实恢复（~24h）** → Free 档耗尽后 grok 通道会反复「恢复→打→402/429→再限」；grok_search 的 30d 更贴真实节奏（按月），空转更少。
+2. **grok 冷却（2min~1h）短于 Free 真实恢复（~24h）** → Free 档耗尽后 grok 通道会反复「恢复→打→402/429→再限」；grok_search 免费额度直接持久标记不回池，无空转。
 3. **测账号有副作用** → 测 grok 可能写 snapshot、触发 `persistGrokRateLimit`、或 402 时临时下线 30min；测 grok_search 在 HTTP ≥400 时 `SetError`/临时下线（按转发链路同语义，见 §5）。两平台测试都不走调度资格门，冷却中的账号也能测。
-4. **grok_search 免费额度 30d 冷却不看 `Retry-After` 是刻意设计** → console 免费耗尽 429 常无可靠重置信号；读头/body 的精确冷却只作用于瞬时限流分支（§4.2）。不要把两支合并成"全读头"或"全不读"。
+4. **grok_search 免费额度持久标记不看 `Retry-After` 是刻意设计** → console 免费耗尽 429 常无可靠重置信号，且重置周期不可预期（实测 >2 月未恢复）；读头/body 的精确冷却只作用于瞬时限流分支（§4.2）。不要把两支合并成"全读头"或"全不读"。
 5. **混淆"额度重置"两层** → xAI 额度恢复（一样，同时回血）≠ sub2api 调度冷却（两套不同代码）。用户问"多久重置"要先确认问的是哪层。
 6. **grok_search SSO 失效不会自愈** → 无 refresh，401/403 权限失效需管理员重导 SSO；grok OAuth 有 refresh 可自愈。
 7. **别把 DPoP 的 proxyURL 参数当成可有可无** → 历史上 mint 固定直连造成同 SSO 双出口风控面；现契约强制 mint 与业务同出口、缓存键含 proxyURL（§4.5）。重构调用链时丢失该参数会静默退化回旧行为。

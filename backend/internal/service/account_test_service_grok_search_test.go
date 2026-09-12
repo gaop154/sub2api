@@ -185,7 +185,7 @@ func TestAccountTestService_GrokSearchErrorStateMapping(t *testing.T) {
 		wantSetError    bool
 		wantErrorMatch  string
 		wantTemp        bool
-		wantTempAtLeast time.Duration // 临时下线 until 距 now 的最小阈值，区分 2min / 5min / 30d
+		wantTempAtLeast time.Duration // 临时下线 until 距 now 的最小阈值，区分 2min / 5min
 	}{
 		{
 			name:           "401 SSO 失效 → SetError",
@@ -220,11 +220,11 @@ func TestAccountTestService_GrokSearchErrorStateMapping(t *testing.T) {
 			wantTempAtLeast: 4 * time.Minute,
 		},
 		{
-			name:            "429 免费额度耗尽 → 长冷却 30d",
-			statusCode:      http.StatusTooManyRequests,
-			body:            `{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits"}`,
-			wantTemp:        true,
-			wantTempAtLeast: 29 * 24 * time.Hour,
+			name:           "429 免费额度耗尽 → SetError 持久标记",
+			statusCode:     http.StatusTooManyRequests,
+			body:           `{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits"}`,
+			wantSetError:   true,
+			wantErrorMatch: "free usage quota exhausted",
 		},
 		{
 			name:            "5xx 非池模式 → 短冷却 2min",

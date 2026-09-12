@@ -58,21 +58,24 @@ func cfChallengeHeaders() http.Header {
 
 // === 429 分支 ===
 
-// TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_LongCooldown 验证 REQ-1：
-// 429 body 含 "free usage quota"（实测 console 免费额度耗尽形态）→ 长冷却 30d，
-// 而非原有的 5min 短退避（恢复后又 429 的无效循环）。
-func TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_LongCooldown(t *testing.T) {
+// TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_PersistentError 验证 R13：
+// 429 body 含 "free usage quota"（实测 console 免费额度耗尽形态）→ markGrokSearchQuotaExhausted
+// 持久标记（DB status=error + schedulable=false，不自动回池），而非临时冷却——
+// 重置周期实测不可预期（>2 月未恢复），到期回池只是周期性制造 429 探测；管理员充值/换号后手动恢复。
+func TestHandleGrokSearchAccountUpstreamError_429FreeQuotaExhausted_PersistentError(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := grokSearchStatusTestAccount(101)
 	body := []byte(`{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits or provision an API key at https://console.x.ai"}`)
 
 	svc.handleGrokSearchAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, body)
 
-	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account), "免费额度耗尽应 block 账号")
+	// markGrokSearchQuotaExhausted 内部调 BlockAccountScheduling（24h 兜底），以此作为持久标记生效的内存信号；
+	// DB 层为 SetError（status=error + schedulable=false，不自动回池），由 account_test_service 的集成测试覆盖。
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account), "免费额度耗尽应 block 账号（markGrokSearchQuotaExhausted）")
 	until, ok := grokSearchLoadRuntimeBlockUntil(t, svc, account.ID)
 	require.True(t, ok)
-	require.WithinDuration(t, time.Now().Add(grokSearchFreeQuotaCooldown), until, 5*time.Second,
-		"冷却时长应为 30d（grokSearchFreeQuotaCooldown）")
+	require.WithinDuration(t, time.Now().Add(24*time.Hour), until, 5*time.Second,
+		"markGrokSearchQuotaExhausted 兜底 block 24h")
 }
 
 // TestHandleGrokSearchAccountUpstreamError_429NormalRateLimit_ShortCooldown 验证：
@@ -90,7 +93,7 @@ func TestHandleGrokSearchAccountUpstreamError_429NormalRateLimit_ShortCooldown(t
 	until, ok := grokSearchLoadRuntimeBlockUntil(t, svc, account.ID)
 	require.True(t, ok)
 	require.WithinDuration(t, time.Now().Add(grokSearchRateLimitCooldown), until, 5*time.Second,
-		"冷却时长应为 5min（grokSearchRateLimitCooldown），不因 resource-exhausted code 被误判为长冷却")
+		"冷却时长应为 5min（grokSearchRateLimitCooldown），不因 resource-exhausted code 被误判为免费额度耗尽走持久标记")
 }
 
 // TestHandleGrokSearchAccountUpstreamError_429Cloudflare_NotBlocked 验证 REQ-2/决策树：

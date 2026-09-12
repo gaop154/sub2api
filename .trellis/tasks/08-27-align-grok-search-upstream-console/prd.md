@@ -72,6 +72,13 @@ sub2api 的 grok_search 参照 grok2api 开发，但参照的是 2026-08-05 之�
 - 429 非 CF、非免费额度分支：取头优先、body 次之的时长，clamp 到 [1min, 24h]；无信号维持 5min 兜底。
 - 免费额度 30d、CF 不惩罚等既有语义不变。
 
+### R13（本仓库实测修正，2026-09-12 追加）免费额度耗尽改持久标记
+- 背景：30d 冷却的依据是「实测额度按月重置」（`a54e8918c`）；后续实测 >2 个月额度仍未恢复，重置周期不可预期，到期回池只是周期性制造 429 探测。
+- 429 + `isGrokSearchFreeQuotaExhausted`：改调 `markGrokSearchQuotaExhausted` —— `SetError` 持久标记（status=error + schedulable=false），不再自动回池；管理员充值/换号/确认额度恢复后手动恢复账号。
+- 转发链路（`handleGrokSearchAccountUpstreamError`）与测试连接路径（`account_test_service.go` 429 分支）同步。
+- `grokSearchFreeQuotaCooldown` 常量删除（无消费方），相关注释同步。
+- reason 文案与 401 重认证区分：`grok_search free usage quota exhausted; purchase credits or replace account`。
+
 ## 明确不做（Non-goals）
 
 - ❌ 不取消默认注入 web_search/x_search——与上游分叉是刻意的产品决策（grok_search 定位即搜索通道）；仅在代码注释标注分叉及理由。
@@ -94,14 +101,16 @@ sub2api 的 grok_search 参照 grok2api 开发，但参照的是 2026-08-05 之�
 - [ ] AC9 `reasoning.effort:"auto"` 原样发出（不被改写 medium）；不传 effort 仍兜底 medium。
 - [ ] AC10 mint 与业务请求使用同一 proxyURL（测试断言 mint 请求带代理）；不同 proxyURL 产出不同缓存键。
 - [ ] AC11 mint 响应带 Date 头时 proof 的 iat 反映 skew（含正/负偏差）；Date 缺失按 0 且流程正常。
-- [ ] AC12 429 带 `Retry-After` 头或 body `"Resets in"` 时按解析值（clamp 后）冷却；无信号维持 5min；免费额度仍 30d。
+- [ ] AC12 429 带 `Retry-After` 头或 body `"Resets in"` 时按解析值（clamp 后）冷却；无信号维持 5min；免费额度耗尽走 R13 持久标记（2026-09-12 修订，原 30d 冷却语义作废）。
 - [ ] AC13 既有测试全绿（service 包相关测试），`go build ./...` 通过；受默认产物变化影响的既有断言同步修正。
 - [ ] AC14 注释/doc 与实际行为一致（1M、30 天、注入分叉、新透传能力说明）。
+
+- [ ] AC15 429 免费额度耗尽后账号被持久标记 error（不自动回池，无到期恢复语义）；测试连接路径同语义；401/CF/瞬时 429 行为不变。
 
 ## 已拍板决策
 
 1. max_output_tokens 回正 1M（用户确认）。
-2. 免费额度耗尽冷却 = 30 天（代码 `a54e8918c` 已实现，spec 一致，本任务只修注释）。
+2. 免费额度耗尽 = 持久标记 SetError 不回池（2026-09-12 修订：实测 >2 月额度未恢复，原「按月重置→30d 冷却」假设失效）。
 3. 保持默认注入搜索工具（平台定位特性，刻意与上游 339617a2 分叉）。
 
 ## 参考

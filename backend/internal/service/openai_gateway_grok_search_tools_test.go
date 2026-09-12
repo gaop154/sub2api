@@ -601,17 +601,18 @@ func TestHandleGrokSearchAccountUpstreamError_429PreciseCooldown(t *testing.T) {
 		grokSearchRequireCooldown(t, 206, http.Header{}, rateLimitBody, grokSearchRateLimitCooldown)
 	})
 
-	t.Run("免费额度耗尽仍 30d（优先于 Retry-After 头）", func(t *testing.T) {
+	t.Run("免费额度耗尽走持久标记（优先于 Retry-After 头）", func(t *testing.T) {
 		h := http.Header{}
 		h.Set("Retry-After", "120")
 		svc := &OpenAIGatewayService{}
 		account := grokSearchStatusTestAccount(207)
 		body := `{"code":"resource-exhausted","error":"Free usage quota exceeded. Purchase credits"}`
 		svc.handleGrokSearchAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, h, []byte(body))
+		// markGrokSearchQuotaExhausted：持久标记（BlockAccountScheduling 24h 兜底），不受 Retry-After 头影响
 		require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 		until, ok := grokSearchLoadRuntimeBlockUntil(t, svc, account.ID)
 		require.True(t, ok)
-		require.WithinDuration(t, time.Now().Add(grokSearchFreeQuotaCooldown), until, 5*time.Second,
-			"免费额度耗尽应保持 30d 长冷却，不受 Retry-After 头影响")
+		require.WithinDuration(t, time.Now().Add(24*time.Hour), until, 5*time.Second,
+			"免费额度耗尽应走 markGrokSearchQuotaExhausted 持久标记（24h 兜底 block），不受 Retry-After 头影响")
 	})
 }
